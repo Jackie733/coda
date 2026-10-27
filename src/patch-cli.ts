@@ -858,6 +858,10 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
       return 1;
     }
 
+    if (disposition !== "keep" && disposition !== "discard" && disposition !== null) {
+      throw new Error("保留/丢弃回调返回无效值；候选补丁未完成处置。");
+    }
+
     if (disposition === "keep") {
       output(stdout, `已生成并保留隔离工作树（未提交）：${visibleControls(owned.worktreePath)}\n`);
       output(stdout, "源工作树文件、索引和已有改动未被更改；没有执行模型生成命令、提交、推送、创建 PR 或合并。\n");

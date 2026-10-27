@@ -466,6 +466,29 @@ test("discard removes generated isolated worktree without changing the source wo
   });
 });
 
+test("unexpected disposition values fail closed instead of being treated as discard", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
+    const output = captureOutput();
+    const mock = commonOptions(root, output, patchContent(), "keep");
+    const exitCode = await runPatchCli({
+      ...mock.options,
+      chooseDisposition: async () => "unexpected-value" as unknown as "keep" | "discard" | null,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(mock.fetchCalls, 1);
+    assert.match(output.text, /补丁流程失败/);
+    assert.match(output.text, /保留\/丢弃回调返回无效值/);
+    assert.doesNotMatch(output.text, /已生成并保留隔离工作树|已生成后丢弃隔离补丁工作树/);
+    assert.deepEqual(await originState(root), before);
+    assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
+    const listing = git(root, "worktree", "list", "--porcelain").toString("utf8");
+    assert.equal(listing.split("\n").filter((line) => line.startsWith("worktree ")).length, 2);
+  });
+});
+
 test("malformed model patches fail closed and preserve origin state", async () => {
   await withDirtyRepository(async ({ root }) => {
     const before = await originState(root);
