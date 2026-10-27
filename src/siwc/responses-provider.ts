@@ -1,5 +1,6 @@
 import type { Provider } from "../application.js";
 import type { ModelRequest } from "../model-provider.js";
+import { safeCliErrorText } from "../safe-cli-error.js";
 import { CredentialDurabilityUncertainError } from "./credential-store.js";
 
 export const SIWC_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
@@ -47,6 +48,26 @@ export class SiwcProviderError extends Error {
     ].filter(Boolean);
     return `${this.message}${details.length ? `\n诊断信息：${details.join("；")}` : ""}`;
   }
+}
+
+export function safeSiwcProviderErrorText(error: SiwcProviderError, fallback: string): string {
+  const publicCodes = new Set([
+    "subscription_sharing_usage_limit_exceeded",
+    "subscription_sharing_usage_unavailable",
+    "subscription_sharing_user_unavailable",
+    "subscription_sharing_user_not_eligible",
+    "subscription_sharing_unsupported_capability",
+    "subscription_sharing_route_not_supported",
+    "subscription_sharing_invalid_user",
+    "chatpass_v2_scope_not_authorized",
+    "chatpass_v2_invalid_authorization_context",
+    "unsupported_parameter",
+    "unsupported_capability",
+    "unsupported_value",
+  ]);
+  const allowlistedLiterals = [SIWC_USAGE_URL, SIWC_RESPONSES_ENDPOINT];
+  if (error.code && publicCodes.has(error.code)) allowlistedLiterals.push(`error.code=${error.code}`);
+  return safeCliErrorText(error.toUserMessage(), fallback, allowlistedLiterals);
 }
 
 export type SiwcResponsesProviderOptions = Readonly<{

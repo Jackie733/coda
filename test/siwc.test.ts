@@ -602,7 +602,7 @@ test("valid consent denial stops before token exchange and does not save an acco
   });
 });
 
-test("authorization-code exchange maps invalid_grant and invalid_client without exposing descriptions", async () => {
+test("reauth without callback client_id uses the pending issued ID in token exchange and maps OAuth errors safely", async () => {
   const cases = [
     {
       code: "invalid_grant",
@@ -634,6 +634,7 @@ test("authorization-code exchange maps invalid_grant and invalid_client without 
       assert.equal(mocks.getTokenExchangeCount(), 1);
       assert.match(output.value, item.expected);
       if (item.code === "invalid_grant") {
+        assert.equal(mocks.getAuthorizationUrl()?.searchParams.get("client_id"), ISSUED_CLIENT_ID);
         assert.ok(output.value.includes(`issued client ID 为 ${ISSUED_CLIENT_ID}`));
         assert.equal(mocks.getTokenBody()?.get("client_id"), ISSUED_CLIENT_ID);
         assert.match(output.value, new RegExp(`npm run siwc -- login --plan-usage --client-id ${ISSUED_CLIENT_ID}`));
@@ -886,7 +887,7 @@ test("temporary-file fsync and rename failures keep the original credential file
 });
 
 test("directory fsync failure reports durability uncertainty after the new store is committed", async () => {
-  await withTemporaryStore(async (storePath) => {
+  await withTemporaryStore(async (storePath, root) => {
     await initializedStore(storePath, accountRecord({ accessToken: "synthetic-old-durable-token" }));
     const originalContents = await readFile(storePath, "utf8");
     const originalStore = await readSiwcCredentialStore(storePath);
@@ -896,6 +897,7 @@ test("directory fsync failure reports durability uncertainty after the new store
       ...originalStore,
       accounts: Object.freeze(originalStore.accounts.map((account) => Object.freeze({
         ...account,
+        email: "committed-after-fsync-failure@example.invalid",
         accessToken: newToken,
         refreshToken: "synthetic-new-refresh-token-never-log",
       }))),
@@ -918,6 +920,17 @@ test("directory fsync failure reports durability uncertainty after the new store
     const actualStore = await readSiwcCredentialStore(storePath);
     assert.equal(actualStore?.accounts[0]?.accessToken, newToken);
     assert.equal(actualStore?.accounts[0]?.refreshToken, "synthetic-new-refresh-token-never-log");
+    assert.equal(actualStore?.accounts[0]?.email, "committed-after-fsync-failure@example.invalid");
+    const statusOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({
+      argv: ["status"],
+      env: { XDG_CONFIG_HOME: path.join(root, "config") },
+      stdout: statusOutput,
+    }), 0);
+    assert.match(statusOutput.value, /活动账户：committed-after-fsync-failure@example\.invalid · oaiapp_synthetic_client/);
+    assert.doesNotMatch(statusOutput.value, /fixture@example\.invalid/);
+    assert.match(statusOutput.value, /已授予 plan-use scope/);
+    assert.doesNotMatch(statusOutput.value, /synthetic-new-rotated-token-never-log|synthetic-new-refresh-token-never-log/);
   });
 });
 
@@ -1064,10 +1077,27 @@ test("model catalog is fetched for the account and keeps only visible display sl
 test("status and model list explain plan-specific usage without assuming the account tier", async () => {
   await withTemporaryStore(async (storePath, root) => {
     await initializedStore(storePath);
+    const beforeUpdate = await readSiwcCredentialStore(storePath);
+    assert.ok(beforeUpdate);
+    const syncedToken = "synthetic-successfully-synced-token";
+    const committedStore = Object.freeze({
+      ...beforeUpdate,
+      accounts: Object.freeze(beforeUpdate.accounts.map((account) => Object.freeze({
+        ...account,
+        email: "committed-after-fsync-success@example.invalid",
+        accessToken: syncedToken,
+      }))),
+    });
+    await writeSiwcCredentialStoreAtomically(storePath, committedStore);
+    assert.equal((await readSiwcCredentialStore(storePath))?.accounts[0]?.accessToken, syncedToken);
     const env = { XDG_CONFIG_HOME: path.join(root, "config") };
     const statusOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
     assert.equal(await runSiwcCli({ argv: ["status"], env, stdout: statusOutput }), 0);
     assert.ok(statusOutput.value.includes(SIWC_PLAN_USAGE_NOTICE));
+    assert.match(statusOutput.value, /活动账户：committed-after-fsync-success@example\.invalid · oaiapp_synthetic_client/);
+    assert.doesNotMatch(statusOutput.value, /fixture@example\.invalid/);
+    assert.match(statusOutput.value, /已授予 plan-use scope/);
+    assert.doesNotMatch(statusOutput.value, /synthetic-successfully-synced-token|synthetic-refresh-token-never-log/);
     assert.match(statusOutput.value, /Plus 的五小时 Work\/Codex 限额跨适用应用共享/);
     assert.match(statusOutput.value, /Pro 100\/200\/500 当前没有这项五小时限额/);
     assert.match(statusOutput.value, /本 CLI 无法识别账户方案/);
@@ -1257,15 +1287,29 @@ test("rotated refresh credentials with directory durability uncertainty stop the
   });
 });
 
-test("SSE parser handles complete and one-byte CRLF/CR/LF streams and only completes on response.completed", async () => {
-  const sample = 'event: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"ok"}\r\n\r\nevent: response.completed\r\ndata: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}}\r\n\r\n';
+test("SSE parser handles complete, one-byte, and irregular UTF-8 CRLF/CR/LF streams only through response.completed", async () => {
+  const sample = 'event: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"café 東京"}\r\n\r\nevent: response.completed\r\ndata: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"café 東京"}]}]}}\r\n\r\n';
   const encoder = new TextEncoder();
   const crlfBytes = encoder.encode(sample);
+  const irregularChunks = (bytes: Uint8Array): Uint8Array[] => {
+    const sizes = [2, 1, 5, 3, 8, 4, 1, 6];
+    const chunks: Uint8Array[] = [];
+    let offset = 0;
+    let index = 0;
+    while (offset < bytes.length) {
+      const size = sizes[index % sizes.length] ?? 1;
+      chunks.push(bytes.slice(offset, offset + size));
+      offset += size;
+      index += 1;
+    }
+    return chunks;
+  };
   const variants = [
     { name: "complete CRLF block", chunks: [crlfBytes] },
     { name: "single-byte CRLF chunks", chunks: Array.from(crlfBytes, (byte) => new Uint8Array([byte])) },
     { name: "single-byte standalone CR chunks", chunks: Array.from(encoder.encode(sample.replace(/\r\n/g, "\r")), (byte) => new Uint8Array([byte])) },
     { name: "single-byte LF chunks", chunks: Array.from(encoder.encode(sample.replace(/\r\n/g, "\n")), (byte) => new Uint8Array([byte])) },
+    { name: "irregular UTF-8 chunks", chunks: irregularChunks(crlfBytes) },
   ];
   for (const variant of variants) {
     const stream = new ReadableStream<Uint8Array>({
@@ -1279,7 +1323,7 @@ test("SSE parser handles complete and one-byte CRLF/CR/LF streams and only compl
       fetchImpl: async () => new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
     });
     const response = await provider.send(responsesRequest());
-    assert.deepEqual(await response.json(), { output_text: "ok" }, variant.name);
+    assert.deepEqual(await response.json(), { output_text: "café 東京" }, variant.name);
   }
 
   const doneOnly = createSiwcResponsesProvider({
@@ -1446,6 +1490,7 @@ test("a stream without response.completed fails and direct-admission detail text
     { status: 403, requestId: "synthetic-admission-control", detailText: "policy\ndenied", expectedDetail: "policy denied" },
     { status: 403, requestId: "synthetic-admission-bidi", detailText: `safe-before ${String.fromCodePoint(0x202e)} spoofed-after ${String.fromCodePoint(0x2066)} left ${String.fromCodePoint(0x2067)} right ${String.fromCodePoint(0x2068)} first ${String.fromCodePoint(0x2069)} done`, expectedDetail: "safe-before \\u202E spoofed-after \\u2066 left \\u2067 right \\u2068 first \\u2069 done" },
     { status: 403, requestId: "synthetic-admission-bidi-secret", detailText: `synthetic access${String.fromCodePoint(0x202e)}_token must-not-display`, expectedDetail: null },
+    { status: 403, requestId: "req-short", detailText: "provider failed: acce\u200Ess_token: abc12345", expectedDetail: null },
     { status: 403, requestId: "synthetic-admission-bidi-long-token", detailText: `abcdefghijklmnop${String.fromCodePoint(0x202e)}qrstuvwxyzABCDEF`, expectedDetail: null },
     { status: 403, requestId: "synthetic-admission-bidi-url", detailText: `https:${String.fromCodePoint(0x202e)}//synthetic.example/credential`, expectedDetail: null },
     { status: 403, requestId: "synthetic-admission-length", detailText: "diagnostic text ".repeat(30), expectedDetail: `${"diagnostic text ".repeat(30).slice(0, 239)}…` },
@@ -1487,6 +1532,47 @@ test("a stream without response.completed fails and direct-admission detail text
       return true;
     });
   }
+});
+
+test("readonly CLI suppresses a U+200E-obfuscated short token from the built-in Responses provider 403 path", async () => {
+  const detail = "provider failed: acce\u200Ess_token: abc12345";
+  assert.ok(detail.includes("\u200e"));
+  const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+  let responseCalls = 0;
+  let fallbackCalls = 0;
+  const provider = createSiwcResponsesProvider({
+    getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+    fetchImpl: async (input, init) => {
+      responseCalls += 1;
+      assert.equal(String(input), SIWC_RESPONSES_ENDPOINT);
+      assert.equal(init?.method, "POST");
+      return Response.json({ detail }, { status: 403, headers: { "openai-request-id": "synthetic-u200e-403" } });
+    },
+  });
+
+  const exitCode = await runReadonlyCli({
+    cwd: "/synthetic/repository",
+    requestMode: "siwc",
+    model: "synthetic-current-slug",
+    providerLabel: "ChatGPT plan (SIWC)",
+    env: {},
+    inspect: async () => syntheticSnapshot,
+    stdout: output,
+    confirmSend: async () => true,
+    provider,
+    fetchImpl: async () => {
+      fallbackCalls += 1;
+      throw new Error("API-key fallback must not run");
+    },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(responseCalls, 1);
+  assert.equal(fallbackCalls, 0);
+  assert.match(output.value, /HTTP 403/);
+  assert.match(output.value, /request ID=synthetic-u200e-403/);
+  assert.doesNotMatch(output.value, /abc12345|\u200e|access_token/);
+  assert.doesNotMatch(output.value, /API-key fallback must not run/);
 });
 
 test("readonly CLI previews SIWC JSON without API key, sends only after approval, and never falls back", async () => {

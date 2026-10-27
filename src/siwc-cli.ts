@@ -4,7 +4,7 @@ import type { Readable, Writable } from "node:stream";
 import { CredentialDurabilityUncertainError, updateSiwcCredentialStore, accountFromStore, planUsageAuthorized, readSiwcCredentialStore, resolveSiwcStorePath, siwcAccountStatuses } from "./siwc/credential-store.js";
 import { isSafeIssuedClientId, runSiwcAuthorization, SiwcAuthorizationError, type AuthorizationOptions } from "./siwc/oauth.js";
 import { getSiwcAccessTokenForUsage, logoutSiwcAccount } from "./siwc/session.js";
-import { createSiwcResponsesProvider, listSiwcModels, SIWC_PLAN_USAGE_NOTICE, SIWC_USAGE_URL, SiwcProviderError } from "./siwc/responses-provider.js";
+import { createSiwcResponsesProvider, listSiwcModels, safeSiwcProviderErrorText, SIWC_PLAN_USAGE_NOTICE, SIWC_USAGE_URL, SiwcProviderError } from "./siwc/responses-provider.js";
 import { runReadonlyCli, visibleControls, type ReadonlyCliOptions } from "./readonly-cli.js";
 import { safeCliErrorText } from "./safe-cli-error.js";
 
@@ -48,7 +48,9 @@ function write(stdout: Writer, text: string): void {
 }
 
 function safeError(error: unknown): string {
-  if (error instanceof SiwcProviderError) return visibleControls(error.toUserMessage());
+  if (error instanceof SiwcProviderError) {
+    return visibleControls(safeSiwcProviderErrorText(error, "SIWC 操作失败；为保护凭据，错误详情已隐藏。"));
+  }
   if (error instanceof CredentialDurabilityUncertainError) return visibleControls(error.message);
   if (error instanceof SiwcAuthorizationError) return visibleControls(error.message);
   return visibleControls(safeCliErrorText(error, "操作未完成；为保护凭据，错误详情已隐藏。"));

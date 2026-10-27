@@ -4,7 +4,7 @@ import type { Readable, Writable } from "node:stream";
 import { ApplicationStateMachine, requestAfterApproval, type Provider } from "./application.js";
 import { createOpenAICompatibleProvider, type ModelRequest } from "./model-provider.js";
 import { inspectRepository, type RepositorySnapshot } from "./repo-context.js";
-import { SIWC_PLAN_USAGE_NOTICE, SiwcProviderError } from "./siwc/responses-provider.js";
+import { SIWC_PLAN_USAGE_NOTICE, safeSiwcProviderErrorText, SiwcProviderError } from "./siwc/responses-provider.js";
 import { safeCliErrorText } from "./safe-cli-error.js";
 
 const SYSTEM_PROMPT = [
@@ -129,7 +129,9 @@ async function interactiveConsent(stdin: Reader, stdout: Writer): Promise<boolea
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof SiwcProviderError) return visibleControls(error.toUserMessage());
+  if (error instanceof SiwcProviderError) {
+    return visibleControls(safeSiwcProviderErrorText(error, "SIWC 请求失败；为保护凭据，错误详情已隐藏。"));
+  }
   return visibleControls(safeCliErrorText(error, "操作未完成；为保护凭据，错误详情已隐藏。"));
 }
 

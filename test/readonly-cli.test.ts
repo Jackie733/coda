@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import { inspectRepository } from "../src/repo-context.js";
 import { endpointFrom, runReadonlyCli } from "../src/readonly-cli.js";
+import { safeCliErrorText } from "../src/safe-cli-error.js";
 
 async function createSyntheticRepository(): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), "readonly-cli-fixture-"));
@@ -252,6 +253,51 @@ test("readonly CLI hides token-bearing error messages without printing stack or 
     assert.equal(exitCode, 1);
     assert.match(output.text, /为保护凭据，错误详情已隐藏/);
     assert.doesNotMatch(output.text, /synthetic-access-token-never-log|nested cause|synthetic-frame/);
+  });
+});
+
+test("safeCliErrorText strips U+200E before matching a short access_token value", () => {
+  const message = "provider failed: acce\u200Ess_token: abc12345";
+  const fallback = "为保护凭据，错误详情已隐藏。";
+  assert.ok(message.includes("\u200e"));
+
+  const result = safeCliErrorText(new Error(message), fallback);
+
+  assert.equal(result, fallback);
+  assert.doesNotMatch(result, /abc12345|\u200e/);
+});
+
+test("safeCliErrorText preserves only exact allowlisted public URL literals", () => {
+  const usageUrl = "https://chatgpt.com/settings/usage";
+  const responsesUrl = "https://api.openai.com/v1/responses";
+  const fallback = "为保护凭据，错误详情已隐藏。";
+  const safeMessage = `Review usage at ${usageUrl}; the allowed route is ${responsesUrl}.`;
+
+  assert.equal(safeCliErrorText(new Error(safeMessage), fallback, [usageUrl, responsesUrl]), safeMessage);
+  assert.equal(safeCliErrorText(new Error(`${usageUrl}?access_token=synthetic-secret`), fallback, [usageUrl]), fallback);
+});
+
+test("readonly CLI hides bidi-interleaved access_token payloads from generic error, stack, and cause", async () => {
+  await withRepository(async (root) => {
+    const secret = "synthetic-access-token-never-log";
+    const marker = String.fromCodePoint(0x202e);
+    const payload = [...`access_token=${secret}`].join(marker);
+    const failure = new Error(`provider failure: ${payload}`);
+    Object.defineProperty(failure, "cause", { value: new Error(`nested cause: ${payload}`) });
+    failure.stack = `Error: provider failure\n    at synthetic-frame (${payload})`;
+    const output = captureOutput();
+    const exitCode = await runReadonlyCli({
+      cwd: root,
+      env: { OPENAI_MODEL: "synthetic-model", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: output.writer,
+      confirmSend: async () => true,
+      provider: { send: async () => { throw failure; } },
+      fetchImpl: async () => { throw new Error("the injected provider must not use fetchImpl"); },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.match(output.text, /为保护凭据，错误详情已隐藏/);
+    assert.doesNotMatch(output.text, /synthetic-access-token-never-log|access_token|synthetic-frame|nested cause|[\u202e]/);
   });
 });
 

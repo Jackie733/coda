@@ -10,7 +10,7 @@ const SECRET_PATTERNS = [
 ] as const;
 
 /** Return only a non-sensitive Error.message/string; stack and cause are never read or returned. */
-export function safeCliErrorText(value: unknown, fallback: string): string {
+export function safeCliErrorText(value: unknown, fallback: string, allowlistedLiterals: readonly string[] = []): string {
   const message = typeof value === "string" ? value : value instanceof Error ? value.message : null;
   if (!message?.trim()) return fallback;
 
@@ -19,6 +19,10 @@ export function safeCliErrorText(value: unknown, fallback: string): string {
     .replace(BIDI_CONTROLS, "")
     .replace(/\s+/g, " ")
     .trim();
-  if (!detectionText || SECRET_PATTERNS.some((pattern) => pattern.test(detectionText))) return fallback;
+  const textForDetection = allowlistedLiterals.reduce(
+    (text, literal) => literal ? text.replaceAll(literal, " ") : text,
+    detectionText,
+  );
+  if (!textForDetection || SECRET_PATTERNS.some((pattern) => pattern.test(textForDetection))) return fallback;
   return message;
 }
