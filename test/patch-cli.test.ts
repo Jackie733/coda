@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readlink, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { parsePatchArguments, renderDiffForTerminal, runPatchCli } from "../src/patch-cli.js";
 
-type Fixture = Readonly<{ root: string; outsideFile: string; commandMarkers: readonly string[] }>;
+type Fixture = Readonly<{ root: string; outsideFile: string; existingWorktreePath: string; commandMarkers: readonly string[] }>;
 
 function git(root: string, ...args: string[]): Buffer {
   return execFileSync("git", [
@@ -16,15 +17,25 @@ function git(root: string, ...args: string[]): Buffer {
     "-c", "filter.fixture-marker.process=",
     "-c", "filter.fixture-marker.required=false",
     ...args,
-  ], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+  ], {
+    cwd: root,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+    },
+  });
 }
 
 function setLocalGitConfig(root: string, key: string, value: string): void {
   execFileSync("git", ["config", "--local", key, value], { cwd: root, stdio: "ignore" });
 }
 
-async function createDirtyRepository(): Promise<Fixture> {
+async function createDirtyRepository(options: Readonly<{ worktreeConfig?: "unset" | "true" }> = {}): Promise<Fixture> {
   const root = await mkdtemp(path.join(os.tmpdir(), "patch-cli-fixture-"));
+  const existingWorktreePath = `${root}-existing-worktree`;
   const runGit = (...args: string[]) => git(root, ...args);
   runGit("init", "-b", "fixture-main");
   setLocalGitConfig(root, "user.email", "fixture@example.invalid");
@@ -54,6 +65,8 @@ async function createDirtyRepository(): Promise<Fixture> {
   await writeFile(path.join(root, "secrets", "token.ts"), "export const secret = 'never-include-this-either';\n");
   runGit("add", "-A");
   runGit("commit", "-m", "synthetic fixture");
+  if (options.worktreeConfig === "true") setLocalGitConfig(root, "extensions.worktreeConfig", "true");
+  runGit("worktree", "add", "--no-checkout", "--detach", existingWorktreePath, "HEAD");
   setLocalGitConfig(root, "filter.fixture-marker.clean", `touch ${cleanMarker}`);
   setLocalGitConfig(root, "filter.fixture-marker.smudge", `touch ${smudgeMarker}`);
   setLocalGitConfig(root, "filter.fixture-marker.process", `touch ${processMarker}`);
@@ -64,11 +77,11 @@ async function createDirtyRepository(): Promise<Fixture> {
   await writeFile(path.join(root, "README.md"), "# Fixture\nUser staged change.\n");
   runGit("add", "README.md");
   await writeFile(path.join(root, "local-notes.txt"), "Untracked local note: do not copy.\n");
-  return { root, outsideFile, commandMarkers: [cleanMarker, smudgeMarker, processMarker, hookMarker] };
+  return { root, outsideFile, existingWorktreePath, commandMarkers: [cleanMarker, smudgeMarker, processMarker, hookMarker] };
 }
 
-async function withDirtyRepository<T>(callback: (fixture: Fixture) => Promise<T>): Promise<T> {
-  const fixture = await createDirtyRepository();
+async function withDirtyRepository<T>(callback: (fixture: Fixture) => Promise<T>, options: Readonly<{ worktreeConfig?: "unset" | "true" }> = {}): Promise<T> {
+  const fixture = await createDirtyRepository(options);
   try {
     const result = await callback(fixture);
     for (const marker of fixture.commandMarkers) {
@@ -91,20 +104,89 @@ async function withDirtyRepository<T>(callback: (fixture: Fixture) => Promise<T>
         } catch {
           // Fixture cleanup is best effort; production cleanup behavior is asserted by each test.
         }
-        await rm(path.dirname(worktree), { recursive: true, force: true });
+        if (worktree === fixture.existingWorktreePath) {
+          await rm(worktree, { recursive: true, force: true });
+        } else if (path.basename(path.dirname(worktree)).startsWith("cue-agent-patch-")) {
+          await rm(path.dirname(worktree), { recursive: true, force: true });
+        }
       }
     } catch {
       // The fixture may not have reached a valid Git repository.
     }
     await rm(fixture.root, { recursive: true, force: true });
+    await rm(fixture.existingWorktreePath, { recursive: true, force: true });
     await rm(fixture.outsideFile, { force: true });
     for (const marker of fixture.commandMarkers) await rm(marker, { force: true });
   }
 }
 
+function optionalLocalGitConfig(root: string, key: string): string {
+  try {
+    return git(root, "config", "--local", "--get", key).toString("utf8").trim();
+  } catch (error) {
+    if (error instanceof Error && "status" in error && error.status === 1) return "UNSET";
+    throw error;
+  }
+}
+
+async function gitWorktreeRegistryState(root: string): Promise<Readonly<Record<string, string>>> {
+  const commonDirectory = path.resolve(root, git(root, "rev-parse", "--git-common-dir").toString("utf8").trim());
+  const registryDirectory = path.join(commonDirectory, "worktrees");
+  const result: Record<string, string> = {};
+  async function collect(directory: string, relativeDirectory: string): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+      throw error;
+    }
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      const absolutePath = path.join(directory, entry.name);
+      const relativePath = path.posix.join(relativeDirectory, entry.name);
+      if (entry.isDirectory()) await collect(absolutePath, relativePath);
+      else if (entry.isFile()) result[relativePath] = (await readFile(absolutePath)).toString("hex");
+      else if (entry.isSymbolicLink()) result[relativePath] = `symlink:${await readlink(absolutePath)}`;
+    }
+  }
+  await collect(registryDirectory, "");
+  return result;
+}
+
+function assertRegistryEntriesUnchanged(before: Readonly<Record<string, string>>, after: Readonly<Record<string, string>>): void {
+  for (const [entry, bytes] of Object.entries(before)) {
+    assert.equal(after[entry], bytes, `pre-existing linked-worktree registry entry changed: ${entry}`);
+  }
+}
+
+async function snapshotRepositoryFiles(root: string): Promise<Readonly<Record<string, string>>> {
+  const result: Record<string, string> = {};
+  async function collect(directory: string, relativeDirectory: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!relativeDirectory && entry.name === ".git") continue;
+      const absolutePath = path.join(directory, entry.name);
+      const relativePath = path.posix.join(relativeDirectory, entry.name);
+      if (entry.isDirectory()) await collect(absolutePath, relativePath);
+      else if (entry.isFile()) result[relativePath] = (await readFile(absolutePath)).toString("hex");
+      else if (entry.isSymbolicLink()) result[relativePath] = `symlink:${await readlink(absolutePath)}`;
+    }
+  }
+  await collect(root, "");
+  return result;
+}
+
 async function originState(root: string): Promise<Readonly<Record<string, string>>> {
+  const commonDirectory = path.resolve(root, git(root, "rev-parse", "--git-common-dir").toString("utf8").trim());
+  const configBytes = await readFile(path.join(commonDirectory, "config"));
   const indexPath = path.resolve(root, git(root, "rev-parse", "--git-path", "index").toString("utf8").trim());
   return {
+    commonConfigBytes: configBytes.toString("hex"),
+    commonConfigSha256: createHash("sha256").update(configBytes).digest("hex"),
+    extensionsWorktreeConfig: optionalLocalGitConfig(root, "extensions.worktreeConfig"),
+    coreSparseCheckout: optionalLocalGitConfig(root, "core.sparseCheckout"),
+    repositoryFiles: JSON.stringify(await snapshotRepositoryFiles(root)),
+    outsideTargetFile: (await readFile(`${root}-outside.ts`)).toString("hex"),
     head: git(root, "rev-parse", "HEAD").toString("utf8").trim(),
     branch: git(root, "rev-parse", "--abbrev-ref", "HEAD").toString("utf8").trim(),
     index: (await readFile(indexPath)).toString("hex"),
@@ -210,6 +292,7 @@ test("patch CLI requires an explicit plan and exact safe repository-relative fil
 test("cancel sends nothing, does not read the API key, removes its isolated worktree, and preserves staged/unstaged/untracked origin state", async () => {
   await withDirtyRepository(async ({ root }) => {
     const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
     const output = captureOutput();
     let fetchCalls = 0;
     let keyRead = false;
@@ -234,12 +317,14 @@ test("cancel sends nothing, does not read the API key, removes its isolated work
     assert.match(output.text, /已取消：未发送模型请求/);
     assert.match(output.text, /隔离工作树状态：已丢弃/);
     assert.deepEqual(await originState(root), before);
+    assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
   });
 });
 
 test("declining the exact plan and file scope creates no worktree and sends no request", async () => {
   await withDirtyRepository(async ({ root }) => {
     const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
     const output = captureOutput();
     let fetchCalls = 0;
     const exitCode = await runPatchCli({
@@ -257,14 +342,19 @@ test("declining the exact plan and file scope creates no worktree and sends no r
     assert.equal(fetchCalls, 0);
     assert.match(output.text, /计划或文件范围未批准/);
     assert.match(output.text, /没有创建隔离工作树或发送请求/);
-    assert.equal(git(root, "worktree", "list", "--porcelain").toString("utf8").split("\n").filter((line) => line.startsWith("worktree ")).length, 1);
+    assert.equal(git(root, "worktree", "list", "--porcelain").toString("utf8").split("\n").filter((line) => line.startsWith("worktree ")).length, 2);
     assert.deepEqual(await originState(root), before);
+    assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
   });
 });
 
 test("approved patch preview is the exact mock request, diff equals kept worktree, and origin worktree is unchanged", async () => {
   await withDirtyRepository(async ({ root, commandMarkers }) => {
     const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
+    assert.equal(before.extensionsWorktreeConfig, "UNSET");
+    assert.equal(before.coreSparseCheckout, "UNSET");
+    assert.ok(Object.keys(registryBefore).length > 0, "fixture must start with a pre-existing linked-worktree registry");
     const output = captureOutput();
     const mock = commonOptions(root, output, patchContent(), "keep");
     const exitCode = await runPatchCli(mock.options);
@@ -290,11 +380,14 @@ test("approved patch preview is the exact mock request, diff equals kept worktre
     assert.deepEqual(await readdir(path.join(worktree, "src")), ["main.ts"]);
     assert.ok(!materialized.includes(".env.local"));
     assert.ok(!materialized.includes("secrets"));
-    const exactDiff = git(worktree, "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "HEAD", "--").toString("utf8");
+    const exactDiff = git(worktree, "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "HEAD", "--", "src/main.ts").toString("utf8");
     assert.ok(exactDiff.length > 0);
     assert.ok(output.text.includes(exactDiff), "displayed diff must exactly match git diff in the kept worktree");
     assert.equal((await readFile(path.join(worktree, "src", "main.ts"), "utf8")).includes('return "after";'), true);
     assert.deepEqual(await originState(root), before);
+    const registryAfter = await gitWorktreeRegistryState(root);
+    assertRegistryEntriesUnchanged(registryBefore, registryAfter);
+    assert.ok(Object.keys(registryAfter).length > Object.keys(registryBefore).length);
     for (const marker of commandMarkers) {
       await assert.rejects(
         readFile(marker),
@@ -308,6 +401,9 @@ test("approved patch preview is the exact mock request, diff equals kept worktre
 test("normal LF, CR, and TAB source plus multi-line patch text are accepted safely", async () => {
   await withDirtyRepository(async ({ root }) => {
     const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
+    assert.equal(before.extensionsWorktreeConfig, "true");
+    assert.equal(before.coreSparseCheckout, "UNSET");
     const output = captureOutput();
     const original = 'export function whitespace() {\r\n\treturn "before";\r\n}\r\n';
     const replacement = 'export function whitespace() {\r\n\treturn "after";\r\n}\r\n';
@@ -343,12 +439,18 @@ test("normal LF, CR, and TAB source plus multi-line patch text are accepted safe
     assert.match(output.text, /\\x09/);
     assert.match(output.text, /\\x0d/);
     assert.deepEqual(await originState(root), before);
-  });
+    const registryAfter = await gitWorktreeRegistryState(root);
+    assertRegistryEntriesUnchanged(registryBefore, registryAfter);
+    assert.ok(Object.keys(registryAfter).length > Object.keys(registryBefore).length);
+  }, { worktreeConfig: "true" });
 });
 
 test("discard removes generated isolated worktree without changing the source worktree", async () => {
   await withDirtyRepository(async ({ root }) => {
     const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
+    assert.equal(before.extensionsWorktreeConfig, "UNSET");
+    assert.equal(before.coreSparseCheckout, "UNSET");
     const output = captureOutput();
     const mock = commonOptions(root, output, patchContent(), "discard");
     const exitCode = await runPatchCli(mock.options);
@@ -358,14 +460,16 @@ test("discard removes generated isolated worktree without changing the source wo
     assert.match(output.text, /已生成后丢弃隔离补丁工作树/);
     assert.match(output.text, /隔离工作树状态：已丢弃/);
     assert.deepEqual(await originState(root), before);
+    assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
     const listing = git(root, "worktree", "list", "--porcelain").toString("utf8");
-    assert.equal(listing.split("\n").filter((line) => line.startsWith("worktree ")).length, 1);
+    assert.equal(listing.split("\n").filter((line) => line.startsWith("worktree ")).length, 2);
   });
 });
 
 test("malformed model patches fail closed and preserve origin state", async () => {
   await withDirtyRepository(async ({ root }) => {
     const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
     const invalidResponses = [
       patchContent({ path: "README.md" }),
       patchContent({ path: "../README.md" }),
@@ -383,7 +487,8 @@ test("malformed model patches fail closed and preserve origin state", async () =
       assert.doesNotMatch(output.text, /已保留隔离工作树|已生成后丢弃隔离补丁工作树/);
       assert.match(output.text, /补丁流程失败/);
       assert.deepEqual(await originState(root), before);
-      assert.equal(git(root, "worktree", "list", "--porcelain").toString("utf8").split("\n").filter((line) => line.startsWith("worktree ")).length, 1);
+      assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
+      assert.equal(git(root, "worktree", "list", "--porcelain").toString("utf8").split("\n").filter((line) => line.startsWith("worktree ")).length, 2);
     }
   });
 });
@@ -391,6 +496,7 @@ test("malformed model patches fail closed and preserve origin state", async () =
 test("oversized response stream is cancelled before full buffering, JSON parsing, or patch application", async () => {
   await withDirtyRepository(async ({ root }) => {
     const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
     const output = captureOutput();
     let pullCalls = 0;
     let cancelled = false;
@@ -437,6 +543,7 @@ test("oversized response stream is cancelled before full buffering, JSON parsing
     assert.match(output.text, /HTTP 响应超过 524288 字节上限/);
     assert.doesNotMatch(output.text, /已生成并保留隔离工作树|候选补丁在隔离工作树中相对基准 HEAD 的完整 diff/);
     assert.deepEqual(await originState(root), before);
+    assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
   });
 });
 
@@ -479,6 +586,7 @@ test("absolute, traversal, excluded-secret, .git, and symlink paths are rejected
 test("terminal controls in model edits are rejected and never printed raw", async () => {
   await withDirtyRepository(async ({ root }) => {
     const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
     const output = captureOutput();
     const mock = commonOptions(root, output, patchContent({ newText: 'return "\u001b[31mred\u001b[0m";' }), "discard");
     const exitCode = await runPatchCli(mock.options);
@@ -487,6 +595,7 @@ test("terminal controls in model edits are rejected and never printed raw", asyn
     assert.doesNotMatch(output.text, /\u001b/);
     assert.match(output.text, /补丁流程失败/);
     assert.deepEqual(await originState(root), before);
+    assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
   });
 });
 

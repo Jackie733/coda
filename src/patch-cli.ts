@@ -13,7 +13,7 @@ const execFileAsync = promisify(execFile);
 const GIT_ENV_KEYS = ["PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL"] as const;
 const DISALLOWED_OUTPUT_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028-\u2029\u202a-\u202e\u2066-\u2069]/;
 const DISALLOWED_SOURCE_CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u2029\u202a-\u202e\u2066-\u2069]/;
-const SAFE_SPARSE_SEGMENT = /^[A-Za-z0-9._+@-]+$/;
+const SAFE_GIT_PATH_SEGMENT = /^[A-Za-z0-9._+@-]+$/;
 const MAX_PLAN_CHARS = 2_000;
 const MAX_APPROVED_FILES = CONTEXT_LIMITS.maxFiles;
 const MAX_EDITS_PER_FILE = 40;
@@ -173,7 +173,7 @@ function assertPlanAndFiles(planValue: string | undefined, filesValue: readonly 
       Buffer.byteLength(file, "utf8") > 1_024 ||
       /^[a-zA-Z]:/.test(file) ||
       file.startsWith("//") ||
-      file.split("/").some((segment) => segment === "" || segment === "." || segment === ".." || segment.length > 255 || !SAFE_SPARSE_SEGMENT.test(segment))
+      file.split("/").some((segment) => segment === "" || segment === "." || segment === ".." || segment.length > 255 || !SAFE_GIT_PATH_SEGMENT.test(segment))
     ) {
       throw new Error(`不安全或不支持的文件路径：${visibleControls(String(file))}`);
     }
@@ -246,31 +246,12 @@ async function allocateOwnedWorktree(
   return Object.freeze({ repositoryRoot, parentDirectory, worktreePath, baseCommit, disabledFilters: Object.freeze([...disabledFilters]) });
 }
 
-function exactSparsePatterns(approvedFiles: readonly string[]): readonly string[] {
-  const parentDirectories = new Set<string>();
-  for (const file of approvedFiles) {
-    const segments = file.split("/");
-    for (let end = 1; end < segments.length; end += 1) {
-      parentDirectories.add(segments.slice(0, end).join("/"));
-    }
-  }
-  const orderedParents = [...parentDirectories].sort((left, right) =>
-    left.split("/").length - right.split("/").length || left.localeCompare(right),
-  );
-  const patterns = ["/*", "!/*"];
-  for (const directory of orderedParents) {
-    patterns.push(`/${directory}/`, `!/${directory}/*`);
-  }
-  for (const file of approvedFiles) patterns.push(`/${file}`);
-  return Object.freeze(patterns);
-}
-
 async function initializeOwnedWorktree(owned: OwnedWorktree, approvedFiles: readonly string[]): Promise<void> {
   await runGit(
     ["worktree", "add", "--no-checkout", "--detach", owned.worktreePath, owned.baseCommit],
     owned.repositoryRoot,
     256 * 1024,
-    owned.disabledFilters,
+    [...owned.disabledFilters, "core.sparseCheckout=false"],
   );
   // --no-checkout leaves Git 2.43's linked-worktree index empty; load only the selected commit's index metadata without updating files.
   await runGit(
@@ -279,21 +260,12 @@ async function initializeOwnedWorktree(owned: OwnedWorktree, approvedFiles: read
     256 * 1024,
     [...owned.disabledFilters, "core.sparseCheckout=false"],
   );
-  // Non-cone patterns need each parent included explicitly; exclude its children before re-including only approved paths.
-  const sparsePatterns = exactSparsePatterns(approvedFiles);
+  // Keep the complete HEAD index but materialize only exact allowlist entries; never enable sparse checkout or write repository config.
   await runGit(
-    ["sparse-checkout", "set", "--no-cone", "--", ...sparsePatterns],
+    ["checkout-index", "--force", "--", ...approvedFiles],
     owned.worktreePath,
     256 * 1024,
-    owned.disabledFilters,
-  );
-  // Git 2.43 may write a single-file pattern without materializing it; force only exact approved index paths into the worktree.
-  await runGit(["update-index", "--no-skip-worktree", "--", ...approvedFiles], owned.worktreePath, 256 * 1024, owned.disabledFilters);
-  await runGit(
-    ["checkout-index", "--force", "--ignore-skip-worktree-bits", "--", ...approvedFiles],
-    owned.worktreePath,
-    256 * 1024,
-    owned.disabledFilters,
+    [...owned.disabledFilters, "core.sparseCheckout=false"],
   );
   const canonicalWorktree = await realpath(owned.worktreePath);
   const canonicalParent = await realpath(owned.parentDirectory);
@@ -371,7 +343,7 @@ async function canonicalSafeFile(root: string, relativePath: string): Promise<st
     /^[a-zA-Z]:/.test(relativePath) ||
     relativePath.startsWith("//") ||
     relativePath.includes("\\") ||
-    relativePath.split("/").some((segment) => segment === "" || segment === "." || segment === ".." || segment.length > 255 || !SAFE_SPARSE_SEGMENT.test(segment))
+    relativePath.split("/").some((segment) => segment === "" || segment === "." || segment === ".." || segment.length > 255 || !SAFE_GIT_PATH_SEGMENT.test(segment))
   ) {
     throw new Error(`补丁路径不安全：${visibleControls(relativePath)}`);
   }
@@ -858,11 +830,12 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
       await writeSafeSourceFile(owned.worktreePath, file, original.content, contentAfter);
     }
 
+    // Unmaterialized tracked files remain in the full index, so only diff approved paths to avoid false deletions.
     const diff = await runGit(
-      ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "HEAD", "--"],
+      ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "HEAD", "--", ...approvedFiles],
       owned.worktreePath,
       MAX_DIFF_BYTES,
-      owned.disabledFilters,
+      [...owned.disabledFilters, "core.sparseCheckout=false"],
     );
     if (!diff.trim()) throw new Error("应用后没有可审查的差异；未将结果标记为成功。");
     output(stdout, "\n以下是候选补丁在隔离工作树中相对基准 HEAD 的完整 diff；尚未决定保留或丢弃：\n");
