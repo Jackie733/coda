@@ -38,6 +38,7 @@ import {
   listSiwcModels,
   SIWC_MODELS_ENDPOINT,
   SIWC_RESPONSES_ENDPOINT,
+  SIWC_PLAN_USAGE_NOTICE,
   SIWC_USAGE_URL,
   SiwcProviderError,
 } from "../src/siwc/responses-provider.js";
@@ -152,6 +153,7 @@ function makeAuthorizationMocks(options: Readonly<{
   denial?: boolean;
   callbackClientId?: string;
   callbackExpectedStatus?: number;
+  tokenError?: Readonly<{ code: string; status?: number; requestId?: string; description?: string }>;
 }> = {}) {
   let authorizationUrl: URL | undefined;
   let tokenExchangeCount = 0;
@@ -163,6 +165,15 @@ function makeAuthorizationMocks(options: Readonly<{
     if (url === SIWC_TOKEN_ENDPOINT) {
       tokenExchangeCount += 1;
       capturedTokenBody = new URLSearchParams(String(init?.body ?? ""));
+      if (options.tokenError) {
+        return Response.json({
+          error: options.tokenError.code,
+          ...(options.tokenError.description ? { error_description: options.tokenError.description } : {}),
+        }, {
+          status: options.tokenError.status ?? 400,
+          headers: options.tokenError.requestId ? { "openai-request-id": options.tokenError.requestId } : undefined,
+        });
+      }
       const idToken = await signedIdToken({
         nonce: authorizationUrl?.searchParams.get("nonce") ?? "missing-synthetic-nonce",
         ...options.tokenClaims,
@@ -227,20 +238,27 @@ test("first plan-use login discloses consumption, sharing, and direct data flow 
       fetchImpl: mocks.fetchImpl,
       openBrowser: async (url) => {
         disclosureWasVisibleBeforeBrowser = /首次启用 ChatGPT plan 的欢迎说明/.test(output.value) &&
-          /额度可能与其他已连接应用共享/.test(output.value) &&
-          /题目与所选仓库上下文仅在后续单独预览并经你批准推理时直接发送给 OpenAI/.test(output.value) &&
-          /SIWC 凭据只保存在本机/.test(output.value) &&
-          /Coda 不经远端代理/.test(output.value) &&
+          output.value.includes(SIWC_PLAN_USAGE_NOTICE) &&
+          /本机运行的 Coda 进程会接收 OpenAI 官方 OAuth 回调/.test(output.value) &&
+          /将凭据保存在你控制的本机配置目录/.test(output.value) &&
+          /凭据不会发送到 Coda 远端服务/.test(output.value) &&
+          /后续获准推理时，题目与所选仓库上下文由本机直接发送到 OpenAI 官方 Responses API，不经 Coda 远端代理/.test(output.value) &&
           output.value.includes(SIWC_USAGE_URL);
         await mocks.openBrowser(url);
       },
     });
     assert.equal(exitCode, 0);
+    assert.equal(mocks.getAuthorizationUrl()?.searchParams.get("client_id"), "dynamic_agent_client");
     assert.equal(disclosureWasVisibleBeforeBrowser, true);
+    assert.match(output.value, /Plus 的五小时 Work\/Codex 限额跨适用应用共享/);
+    assert.match(output.value, /Pro 100\/200\/500 当前没有这项五小时限额/);
+    assert.match(output.value, /本 CLI 无法识别账户方案/);
+    assert.match(output.value, /app-specific limit/);
     assert.match(output.value, /会消耗本人 ChatGPT plan\/credits/);
-    assert.match(output.value, /题目与所选仓库上下文仅在后续单独预览并经你批准推理时直接发送给 OpenAI/);
-    assert.match(output.value, /SIWC 凭据只保存在本机/);
-    assert.match(output.value, /Coda 不经远端代理/);
+    assert.match(output.value, /本机运行的 Coda 进程会接收 OpenAI 官方 OAuth 回调/);
+    assert.match(output.value, /将凭据保存在你控制的本机配置目录/);
+    assert.match(output.value, /凭据不会发送到 Coda 远端服务/);
+    assert.match(output.value, /后续获准推理时，题目与所选仓库上下文由本机直接发送到 OpenAI 官方 Responses API，不经 Coda 远端代理/);
     assert.match(output.value, new RegExp(SIWC_USAGE_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     const savedStore = await readSiwcCredentialStore(_storePath);
     assert.equal(accountFromStore(savedStore!, ISSUED_CLIENT_ID).planUsageWelcomeSeen, true);
@@ -265,6 +283,7 @@ test("an already-enabled plan account does not repeat the welcome after logout a
     const mocks = makeAuthorizationMocks();
     const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
     let welcomeShownBeforeBrowser = false;
+    let privacyDisclosureBeforeBrowser = false;
     const exitCode = await runSiwcCli({
       argv: ["login", "--plan-usage"],
       env: { XDG_CONFIG_HOME: path.join(root, "config") },
@@ -272,11 +291,17 @@ test("an already-enabled plan account does not repeat the welcome after logout a
       fetchImpl: mocks.fetchImpl,
       openBrowser: async (url) => {
         welcomeShownBeforeBrowser = /首次启用 ChatGPT plan 的欢迎说明/.test(output.value);
+        privacyDisclosureBeforeBrowser = /本机运行的 Coda 进程会接收 OAuth 回调/.test(output.value) &&
+          /凭据不会发送到 Coda 远端服务/.test(output.value) &&
+          /由本机直接发送到 OpenAI 官方 Responses API，不经 Coda 远端代理/.test(output.value);
         await mocks.openBrowser(url);
       },
     });
     assert.equal(exitCode, 0);
+    assert.equal(mocks.getAuthorizationUrl()?.searchParams.get("client_id"), ISSUED_CLIENT_ID);
     assert.equal(welcomeShownBeforeBrowser, false);
+    assert.equal(privacyDisclosureBeforeBrowser, true);
+    assert.ok(output.value.includes(SIWC_PLAN_USAGE_NOTICE));
     assert.match(output.value, /此前已启用 ChatGPT plan usage 账户的重新登录/);
     assert.doesNotMatch(output.value, /首次启用 ChatGPT plan 的欢迎说明/);
     const afterLogin = await readSiwcCredentialStore(storePath);
@@ -356,6 +381,51 @@ test("default login refuses to guess when multiple accounts exist without an act
   });
 });
 
+test("default login reuses the explicitly selected active issued client ID without dynamic registration or repeat welcome", async () => {
+  await withTemporaryStore(async (storePath, root) => {
+    await initializedStore(storePath, accountRecord({ planUsageWelcomeSeen: true }));
+    await saveSiwcAccount(storePath, accountRecord({
+      clientId: "oaiapp_synthetic_second_client",
+      subject: "synthetic-second-subject",
+      email: "second@example.invalid",
+      idToken: "synthetic-second-id-token-never-log",
+      accessToken: "synthetic-second-access-token-never-log",
+      refreshToken: "synthetic-second-refresh-token-never-log",
+      planUsageWelcomeSeen: true,
+    }));
+    const env = { XDG_CONFIG_HOME: path.join(root, "config") };
+    const selectOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({ argv: ["select", ISSUED_CLIENT_ID], env, stdout: selectOutput }), 0);
+    assert.match(selectOutput.value, /活动 SIWC 账户已切换/);
+
+    const mocks = makeAuthorizationMocks();
+    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    let welcomeShownBeforeBrowser = false;
+    const exitCode = await runSiwcCli({
+      argv: ["login", "--plan-usage"],
+      env,
+      stdout: output,
+      fetchImpl: mocks.fetchImpl,
+      openBrowser: async (url) => {
+        welcomeShownBeforeBrowser = /首次启用 ChatGPT plan 的欢迎说明/.test(output.value);
+        await mocks.openBrowser(url);
+      },
+    });
+    assert.equal(exitCode, 0);
+    const authorizationUrl = mocks.getAuthorizationUrl();
+    assert.ok(authorizationUrl);
+    assert.equal(authorizationUrl.searchParams.get("client_id"), ISSUED_CLIENT_ID);
+    assert.equal(authorizationUrl.searchParams.has("agent_name_hint"), false);
+    assert.equal(welcomeShownBeforeBrowser, false);
+    assert.match(output.value, /此前已启用 ChatGPT plan usage 账户的重新登录/);
+    assert.doesNotMatch(output.value, /首次启用 ChatGPT plan 的欢迎说明/);
+    const stored = await readSiwcCredentialStore(storePath);
+    assert.equal(stored?.activeClientId, ISSUED_CLIENT_ID);
+    assert.equal(stored?.accounts.length, 2);
+    assert.equal(mocks.getTokenExchangeCount(), 1);
+  });
+});
+
 test("identity-only login discloses OAuth data handling before opening authorization", async () => {
   await withTemporaryStore(async (_storePath, root) => {
     const mocks = makeAuthorizationMocks({ scopes: SIWC_IDENTITY_SCOPES });
@@ -368,8 +438,10 @@ test("identity-only login discloses OAuth data handling before opening authoriza
       fetchImpl: mocks.fetchImpl,
       openBrowser: async (url) => {
         noticeShownBeforeBrowser = /账户标识/.test(output.value) && /email\/name/.test(output.value) &&
-          /授权 scopes 与令牌/.test(output.value) && /只在本机保存 SIWC 凭据/.test(output.value) &&
-          /Coda 不接收或远端代理/.test(output.value) && /本次身份登录不会发送任务或仓库文本/.test(output.value) &&
+          /授权 scopes 与令牌/.test(output.value) && /本机运行的 Coda 进程会接收 OAuth 回调/.test(output.value) &&
+          /将 SIWC 凭据保存在你控制的本机配置目录/.test(output.value) &&
+          /凭据不会发送到 Coda 远端服务/.test(output.value) && /本次身份登录不会发送任务或仓库文本/.test(output.value) &&
+          /由本机直接发送到 OpenAI 官方 Responses API，不经 Coda 远端代理/.test(output.value) &&
           /之后单独预览并由你批准/.test(output.value);
         await mocks.openBrowser(url);
       },
@@ -480,6 +552,50 @@ test("valid consent denial stops before token exchange and does not save an acco
     assert.equal(mocks.getTokenExchangeCount(), 0);
     assert.equal((await readSiwcCredentialStore(storePath))?.accounts.length, 0);
   });
+});
+
+test("authorization-code exchange maps invalid_grant and invalid_client without exposing descriptions", async () => {
+  const cases = [
+    {
+      code: "invalid_grant",
+      expected: /丢弃该 code.*不要重试同一授权码.*npm run siwc -- login --client-id <issued-client-id> \[--plan-usage\]/,
+    },
+    {
+      code: "invalid_client",
+      expected: /修正官方 client ID\/客户端配置.*不要盲目重试/,
+    },
+  ] as const;
+  for (const item of cases) {
+    await withTemporaryStore(async (storePath, root) => {
+      await initializedStore(storePath);
+      const requestId = `synthetic-oauth-${item.code}`;
+      const secretDescription = `synthetic token-bearing description ${CALLBACK_ACCESS_TOKEN}`;
+      const mocks = makeAuthorizationMocks({
+        tokenError: { code: item.code, status: 400, requestId, description: secretDescription },
+      });
+      const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+      const exitCode = await runSiwcCli({
+        argv: ["login", "--plan-usage"],
+        env: { XDG_CONFIG_HOME: path.join(root, "config") },
+        stdout: output,
+        fetchImpl: mocks.fetchImpl,
+        openBrowser: mocks.openBrowser,
+      });
+      assert.equal(exitCode, 1);
+      assert.equal(mocks.getTokenExchangeCount(), 1);
+      assert.match(output.value, item.expected);
+      assert.match(output.value, new RegExp(`OAuth error=${item.code}`));
+      assert.match(output.value, /HTTP 400/);
+      assert.match(output.value, /response body shape=error-object/);
+      assert.match(output.value, new RegExp(`request ID=${requestId}`));
+      assert.doesNotMatch(output.value, /synthetic token-bearing description|synthetic-access-token-never-log/);
+      const saved = await readSiwcCredentialStore(storePath);
+      const original = accountFromStore(saved!, ISSUED_CLIENT_ID);
+      assert.equal(original.accessToken, CALLBACK_ACCESS_TOKEN);
+      assert.equal(original.refreshToken, CALLBACK_REFRESH_TOKEN);
+      assert.equal(saved?.accounts.length, 1);
+    });
+  }
 });
 
 test("reauthorization rejects a callback client ID that does not match the selected account", async () => {
@@ -839,6 +955,34 @@ test("model catalog is fetched for the account and keeps only visible display sl
   assert.deepEqual(models, [{ slug: "visible-current", displayName: "Visible Current" }]);
 });
 
+test("status and model list explain plan-specific usage without assuming the account tier", async () => {
+  await withTemporaryStore(async (storePath, root) => {
+    await initializedStore(storePath);
+    const env = { XDG_CONFIG_HOME: path.join(root, "config") };
+    const statusOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({ argv: ["status"], env, stdout: statusOutput }), 0);
+    assert.ok(statusOutput.value.includes(SIWC_PLAN_USAGE_NOTICE));
+    assert.match(statusOutput.value, /Plus 的五小时 Work\/Codex 限额跨适用应用共享/);
+    assert.match(statusOutput.value, /Pro 100\/200\/500 当前没有这项五小时限额/);
+    assert.match(statusOutput.value, /本 CLI 无法识别账户方案/);
+    assert.match(statusOutput.value, /app-specific limit/);
+    assert.doesNotMatch(statusOutput.value, /额度与其他已连接应用共享/);
+
+    const modelsOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({
+      argv: ["models"],
+      env,
+      stdout: modelsOutput,
+      fetchImpl: async (input) => {
+        assert.equal(String(input), SIWC_MODELS_ENDPOINT);
+        return Response.json({ models: [] });
+      },
+    }), 0);
+    assert.ok(modelsOutput.value.includes(SIWC_PLAN_USAGE_NOTICE));
+    assert.doesNotMatch(modelsOutput.value, /额度与其他已连接应用共享/);
+  });
+});
+
 test("Responses provider sends only the documented public SSE request and succeeds only at response.completed", async () => {
   const modelText = JSON.stringify({
     understanding: [{ text: "Synthetic code declares a greeting.", citations: [{ path: "src/main.ts", startLine: 1, endLine: 1 }] }],
@@ -1168,7 +1312,7 @@ test("usage-limit stream errors never become success and point to shared plan us
   });
 });
 
-test("a stream without response.completed fails and direct-admission detail bodies preserve safe diagnostics only", async () => {
+test("a stream without response.completed fails and direct-admission detail text is filtered and kept separate from stable codes", async () => {
   const interrupted = createSiwcResponsesProvider({
     getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
     fetchImpl: async () => new Response(sseEvent("response.output_text.delta", { delta: "partial" }), {
@@ -1178,42 +1322,57 @@ test("a stream without response.completed fails and direct-admission detail bodi
   });
   await assert.rejects(interrupted.send(responsesRequest()), /without response.completed/);
 
-  const admissionCases = [
-    { status: 401, requestId: "synthetic-admission-401", code: "admission_denied", param: "scopes" },
-    { status: 403, requestId: "synthetic-admission-403", unsafeParam: "bad\nsynthetic-injected-param-secret" },
-    { status: 503, requestId: "synthetic-admission-503", code: "route_temporarily_unavailable" },
-    { status: 403, requestId: "synthetic-admission-nested-detail", code: "chatpass_v2_scope_not_authorized", param: "resource.invoke", nestedDetail: true },
-  ] as const;
+  const admissionCases: ReadonlyArray<{
+    status: number;
+    requestId: string;
+    code?: string;
+    param?: string;
+    unsafeParam?: string;
+    nestedDetail?: boolean;
+    detailText: string;
+    expectedDetail: string | null;
+  }> = [
+    { status: 401, requestId: "synthetic-admission-401", code: "admission_denied", param: "scopes", detailText: "Selected region does not permit this request.", expectedDetail: "Selected region does not permit this request." },
+    { status: 403, requestId: "synthetic-admission-403", unsafeParam: "bad\nsynthetic-injected-param-secret", detailText: `Denied: Bearer ${CALLBACK_ACCESS_TOKEN}`, expectedDetail: null },
+    { status: 503, requestId: "synthetic-admission-503", code: "route_temporarily_unavailable", detailText: "temporary route failure", expectedDetail: "temporary route failure" },
+    { status: 403, requestId: "synthetic-admission-nested-detail", code: "chatpass_v2_scope_not_authorized", param: "resource.invoke", nestedDetail: true, detailText: "nested private detail", expectedDetail: null },
+    { status: 401, requestId: "synthetic-admission-detail-code", detailText: "invalid_grant", expectedDetail: "invalid_grant" },
+    { status: 403, requestId: "synthetic-admission-control", detailText: "policy\ndenied", expectedDetail: "policy denied" },
+    { status: 403, requestId: "synthetic-admission-length", detailText: "diagnostic text ".repeat(30), expectedDetail: `${"diagnostic text ".repeat(30).slice(0, 239)}…` },
+  ];
   for (const item of admissionCases) {
-    const secretDetail = `synthetic private diagnostic ${item.status}`;
     const providedParam = item.param ?? ("unsafeParam" in item ? item.unsafeParam : undefined);
-    const nestedDetail = "nestedDetail" in item && item.nestedDetail;
+    const nestedDetail = Boolean(item.nestedDetail);
     const detail = nestedDetail
-      ? { ...(item.code ? { code: item.code } : {}), ...(providedParam ? { param: providedParam } : {}), message: secretDetail }
-      : secretDetail;
-    const provider = createSiwcResponsesProvider({
-      getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
-      fetchImpl: async () => Response.json({
-        detail,
-        ...(!nestedDetail && item.code ? { code: item.code } : {}),
-        ...(!nestedDetail && providedParam ? { param: providedParam } : {}),
-      }, { status: item.status, headers: { "openai-request-id": item.requestId } }),
-    });
+      ? { ...(item.code ? { code: item.code } : {}), ...(providedParam ? { param: providedParam } : {}), message: item.detailText }
+      : item.detailText;
+      const provider = createSiwcResponsesProvider({
+        getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+        fetchImpl: async () => Response.json({
+          detail,
+          ...(!nestedDetail && item.code ? { error: { code: item.code, ...(providedParam ? { param: providedParam } : {}) } } : {}),
+          ...(!nestedDetail && providedParam ? { param: providedParam } : {}),
+        }, { status: item.status, headers: { "openai-request-id": item.requestId } }),
+      });
     await assert.rejects(provider.send(responsesRequest()), (error: unknown) => {
       assert.ok(error instanceof SiwcProviderError);
       assert.equal(error.status, item.status);
-      assert.equal(error.code, item.code ?? null);
-      assert.equal(error.param, item.param ?? null);
-      assert.equal(error.bodyShape, "detail-object");
+      const standardErrorObject = !nestedDetail && Boolean(item.code);
+      assert.equal(error.code, standardErrorObject ? item.code ?? null : null);
+      assert.equal(error.param, standardErrorObject ? item.param ?? null : null);
+      assert.equal(error.detail, item.expectedDetail);
+      const expectedShape = standardErrorObject ? "error-object" : "detail-object";
+      assert.equal(error.bodyShape, expectedShape);
       assert.equal(error.requestId, item.requestId);
       const message = error.toUserMessage();
       assert.match(message, new RegExp(`HTTP ${item.status}`));
-      assert.match(message, /response body shape=detail-object/);
+      assert.match(message, new RegExp(`response body shape=${expectedShape}`));
       assert.match(message, new RegExp(`request ID=${item.requestId}`));
-      if (item.code) assert.match(message, new RegExp(`error.code=${item.code}`));
-      if (item.param) assert.match(message, new RegExp(`error.param=${item.param}`));
-      if (nestedDetail) assert.match(message, /check the issued client and grant configuration/i);
-      assert.doesNotMatch(message, /synthetic private diagnostic|synthetic-injected-param-secret/);
+      if (standardErrorObject && item.code) assert.match(message, new RegExp(`error.code=${item.code}`));
+      if (standardErrorObject && item.param) assert.match(message, new RegExp(`error.param=${item.param}`));
+      if (nestedDetail) assert.doesNotMatch(message, /error.code=chatpass_v2_scope_not_authorized|error.param=resource\.invoke/);
+      if (item.expectedDetail) assert.ok(message.includes(JSON.stringify(item.expectedDetail)));
+      assert.doesNotMatch(message, /synthetic-access-token-never-log|synthetic-injected-param-secret|nested private detail/);
       return true;
     });
   }
@@ -1248,6 +1407,7 @@ test("readonly CLI previews SIWC JSON without API key, sends only after approval
       throw new Error("API key must never be read in SIWC mode");
     },
   };
+  let disclosureVisibleBeforeApproval = false;
   const exitCode = await runReadonlyCli({
     cwd: "/synthetic/repository",
     requestMode: "siwc",
@@ -1256,20 +1416,30 @@ test("readonly CLI previews SIWC JSON without API key, sends only after approval
     env,
     inspect: async () => syntheticSnapshot,
     stdout: output,
-    confirmSend: async () => true,
+    confirmSend: async () => {
+      disclosureVisibleBeforeApproval = /本机运行的 Coda 进程会读取并处理你控制的本机配置目录中的 SIWC 凭据/.test(output.value) &&
+        /凭据不会发送到 Coda 远端服务/.test(output.value) &&
+        /所选仓库的有限文本上下文仅在你批准后由本机直接发送给 OpenAI 官方 Responses API/.test(output.value) &&
+        /Coda 远端服务不接收该 payload，也不代理请求/.test(output.value);
+      return true;
+    },
     provider,
     fetchImpl: async () => { throw new Error("no fallback fetch"); },
   });
   assert.equal(exitCode, 0);
+  assert.equal(disclosureVisibleBeforeApproval, true);
   assert.equal(modelCalls, 1);
   assert.equal(keyRead, false);
   assert.equal(sentAuthorization, `Bearer ${CALLBACK_ACCESS_TOKEN}`);
   assert.ok(output.value.includes("ChatGPT plan"));
   assert.match(output.value, /正在使用 ChatGPT 方案额度/);
   assert.match(output.value, /本次请求会消耗所选账户额度/);
-  assert.match(output.value, /额度可能与其他已连接应用共享/);
-  assert.match(output.value, /任务与所选仓库上下文会在你批准后直接发送给 OpenAI 官方 Responses API/);
-  assert.match(output.value, /Coda 不经远端代理/);
+  assert.ok(output.value.includes(SIWC_PLAN_USAGE_NOTICE));
+  assert.doesNotMatch(output.value, /额度可能与其他已连接应用共享/);
+  assert.match(output.value, /本机运行的 Coda 进程会读取并处理你控制的本机配置目录中的 SIWC 凭据/);
+  assert.match(output.value, /凭据不会发送到 Coda 远端服务/);
+  assert.match(output.value, /所选仓库的有限文本上下文仅在你批准后由本机直接发送给 OpenAI 官方 Responses API/);
+  assert.match(output.value, /Coda 远端服务不接收该 payload，也不代理请求/);
   assert.ok(output.value.includes(SIWC_USAGE_URL));
   assert.ok(output.value.includes(capturedRequest));
   assert.ok(!capturedRequest.includes(CALLBACK_ACCESS_TOKEN));

@@ -33,11 +33,21 @@ export const SIWC_PLAN_SCOPES = Object.freeze([
 export class SiwcAuthorizationError extends Error {
   readonly status?: number;
   readonly requestId?: string;
-  constructor(message: string, details: { status?: number; requestId?: string } = {}) {
-    super(message);
+  readonly code?: string;
+  readonly bodyShape?: string;
+  constructor(message: string, details: { status?: number; requestId?: string; code?: string; bodyShape?: string } = {}) {
+    const diagnostics = [
+      details.status === undefined ? null : `HTTP ${details.status}`,
+      details.code ? `OAuth error=${details.code}` : null,
+      details.bodyShape ? `response body shape=${details.bodyShape}` : null,
+      details.requestId ? `request ID=${details.requestId}` : null,
+    ].filter(Boolean);
+    super(`${message}${diagnostics.length ? `\n诊断信息：${diagnostics.join("；")}` : ""}`);
     this.name = "SiwcAuthorizationError";
     this.status = details.status;
     this.requestId = details.requestId;
+    this.code = details.code;
+    this.bodyShape = details.bodyShape;
   }
 }
 
@@ -85,6 +95,38 @@ function record(value: unknown): value is Record<string, unknown> {
 function safeRequestId(headers: Headers): string | undefined {
   const value = headers.get("openai-request-id") ?? headers.get("x-request-id");
   return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : undefined;
+}
+
+const OAUTH_ERROR_CODES = new Set([
+  "invalid_request",
+  "invalid_client",
+  "invalid_grant",
+  "unauthorized_client",
+  "unsupported_grant_type",
+  "invalid_scope",
+]);
+
+function oauthErrorCode(body: unknown): string | undefined {
+  return record(body) && typeof body.error === "string" && OAUTH_ERROR_CODES.has(body.error)
+    ? body.error
+    : undefined;
+}
+
+function oauthBodyShape(body: unknown): string {
+  if (body === null || body === undefined) return "empty";
+  if (Array.isArray(body)) return "array";
+  if (!record(body)) return "scalar";
+  return typeof body.error === "string" ? "error-object" : "object";
+}
+
+function tokenExchangeFailureMessage(code: string | undefined): string {
+  if (code === "invalid_grant") {
+    return "OpenAI 拒绝了本次授权码 (invalid_grant)；丢弃该 code，不要重试同一授权码。重新授权已有账户时运行 `npm run siwc -- login --client-id <issued-client-id> [--plan-usage]`；若这是首次动态注册，重新启动官方首次授权流程。令牌未保存。";
+  }
+  if (code === "invalid_client") {
+    return "OpenAI 拒绝了 SIWC 客户端配置 (invalid_client)；检查并修正官方 client ID/客户端配置后再开始新的授权，不要盲目重试。令牌未保存。";
+  }
+  return "SIWC token 交换失败；授权码未重试，令牌未保存。";
 }
 
 function formBody(entries: Record<string, string>): URLSearchParams {
@@ -392,9 +434,13 @@ export async function runSiwcAuthorization(options: AuthorizationOptions): Promi
       throw new SiwcAuthorizationError("SIWC token 交换失败；授权码未重试，令牌未保存。");
     });
     if (!tokenResponse.ok) {
-      throw new SiwcAuthorizationError("SIWC token 交换失败；令牌未保存。", {
+      const errorBody: unknown = await tokenResponse.json().catch(() => null);
+      const code = oauthErrorCode(errorBody);
+      throw new SiwcAuthorizationError(tokenExchangeFailureMessage(code), {
         status: tokenResponse.status,
         requestId: safeRequestId(tokenResponse.headers),
+        code,
+        bodyShape: oauthBodyShape(errorBody),
       });
     }
     const tokens: unknown = await tokenResponse.json().catch(() => null);

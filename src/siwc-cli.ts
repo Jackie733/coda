@@ -4,7 +4,7 @@ import type { Readable, Writable } from "node:stream";
 import { CredentialDurabilityUncertainError, updateSiwcCredentialStore, accountFromStore, planUsageAuthorized, readSiwcCredentialStore, resolveSiwcStorePath, siwcAccountStatuses } from "./siwc/credential-store.js";
 import { runSiwcAuthorization, type AuthorizationOptions } from "./siwc/oauth.js";
 import { getSiwcAccessTokenForUsage, logoutSiwcAccount } from "./siwc/session.js";
-import { createSiwcResponsesProvider, listSiwcModels, SIWC_USAGE_URL, SiwcProviderError } from "./siwc/responses-provider.js";
+import { createSiwcResponsesProvider, listSiwcModels, SIWC_PLAN_USAGE_NOTICE, SIWC_USAGE_URL, SiwcProviderError } from "./siwc/responses-provider.js";
 import { runReadonlyCli, type ReadonlyCliOptions } from "./readonly-cli.js";
 
 const USAGE = [
@@ -18,7 +18,9 @@ const USAGE = [
   "  npm run siwc -- inspect [--model <catalog-slug>] [问题]",
   "  npm run siwc -- logout [--client-id <issued-client-id>]",
   "",
-  "login 默认只请求身份 scope；只有显式加 --plan-usage 才请求 ChatGPT 计划用量权限。",
+  "login 默认只请求身份 scope；没有 --client-id 时优先复用活动 issued client ID，其次仅在只有一个已保存账户时复用它。",
+  "多个账户且没有活动选择时拒绝猜测；只有本机尚无账户时才使用官方 dynamic_agent_client 注册首个账户。",
+  "只有显式加 --plan-usage 才请求 ChatGPT 计划用量权限。",
   "ChatGPT plan 使用和 OpenAI API key 计费分开；不会自动兜底或切换。",
   `Manage usage：${SIWC_USAGE_URL}`,
 ].join("\n");
@@ -132,7 +134,7 @@ async function printStatus(stdout: Writer, storePath: string): Promise<void> {
     }
     const active = statuses.find((item) => item.isActive);
     if (active?.planUsageAuthorized && active.signedIn) {
-      write(stdout, "活动账户：ChatGPT plan 授权已启用；真实请求会使用其当前 plan/credits 额度，并与其他已连接应用共享。\n");
+      write(stdout, `活动账户：ChatGPT plan 授权已启用；真实请求会使用其当前 plan/credits 额度。\n${SIWC_PLAN_USAGE_NOTICE}\n`);
     } else {
       write(stdout, "当前没有可直接用于 ChatGPT plan 推理的活动授权。API-key provider 仍是独立模式。\n");
     }
@@ -146,10 +148,13 @@ async function runLogin(args: readonly string[], options: SiwcCliOptions, stdout
   const unexpected = args.filter((arg, index) => arg !== "--plan-usage" && arg !== "--client-id" && (index === 0 || args[index - 1] !== "--client-id"));
   if (unexpected.length > 0) throw new Error(`login 参数不支持：${unexpected.join(" ")}`);
   const store = await readSiwcCredentialStore(storePath);
-  const implicitAccount = !requestedClientId && store?.activeClientId === null && store.accounts.length === 1
+  const activeAccount = !requestedClientId && store?.activeClientId
+    ? store.accounts.find((account) => account.clientId === store.activeClientId)
+    : undefined;
+  const soleAccount = !requestedClientId && !activeAccount && store?.activeClientId === null && store.accounts.length === 1
     ? store.accounts[0]
     : undefined;
-  const clientId = requestedClientId ?? implicitAccount?.clientId;
+  const clientId = requestedClientId ?? activeAccount?.clientId ?? soleAccount?.clientId;
   const existing = clientId ? store?.accounts.find((account) => account.clientId === clientId) : undefined;
   if (requestedClientId && !existing) throw new Error("--client-id 必须是 `siwc status` 显示的本机 issued client ID。");
   if (!clientId && store?.activeClientId === null && store.accounts.length > 1) {
@@ -159,13 +164,13 @@ async function runLogin(args: readonly string[], options: SiwcCliOptions, stdout
   const showPlanUsageWelcome = requestPlanUsage && !previouslyEnabledPlanUsage;
   if (requestPlanUsage) {
     if (showPlanUsageWelcome) {
-      write(stdout, "Continue with ChatGPT：首次启用 ChatGPT plan 的欢迎说明——获准后，每次明确确认的 AI 请求会消耗本人 ChatGPT plan/credits，额度可能与其他已连接应用共享；题目与所选仓库上下文仅在后续单独预览并经你批准推理时直接发送给 OpenAI；SIWC 凭据只保存在本机，Coda 不经远端代理。\n");
+      write(stdout, `Continue with ChatGPT：首次启用 ChatGPT plan 的欢迎说明——获准后，每次明确确认的 AI 请求会消耗本人 ChatGPT plan/credits。${SIWC_PLAN_USAGE_NOTICE} 本机运行的 Coda 进程会接收 OpenAI 官方 OAuth 回调、用授权码换取并处理 SIWC 令牌，再将凭据保存在你控制的本机配置目录；凭据不会发送到 Coda 远端服务。后续获准推理时，题目与所选仓库上下文由本机直接发送到 OpenAI 官方 Responses API，不经 Coda 远端代理。\n`);
     } else {
-      write(stdout, "Continue with ChatGPT：这是此前已启用 ChatGPT plan usage 账户的重新登录，不重复显示首次欢迎说明；后续每次推理仍会显示额度使用、共享和数据处理提示，并附 Usage 管理入口。\n");
+      write(stdout, `Continue with ChatGPT：这是此前已启用 ChatGPT plan usage 账户的重新登录，不重复显示首次欢迎说明。本机运行的 Coda 进程会接收 OAuth 回调、处理令牌并将凭据保存在你控制的本机配置目录；凭据不会发送到 Coda 远端服务。后续获准推理时，任务与所选仓库上下文由本机直接发送到 OpenAI 官方 Responses API，不经 Coda 远端代理；每次仍会显示额度使用和按 plan 区分的限制说明，并附 Usage 管理入口。\n${SIWC_PLAN_USAGE_NOTICE}\n`);
     }
     write(stdout, `可在此查看或管理额度：${SIWC_USAGE_URL}\n`);
   } else {
-    write(stdout, "Continue with ChatGPT：本次只请求身份 scope，不会启用 ChatGPT plan 推理。OpenAI 官方 OAuth 会处理账户标识、返回的基本资料（如 email/name）、授权 scopes 与令牌；应用只在本机保存 SIWC 凭据，Coda 不接收或远端代理。本次身份登录不会发送任务或仓库文本；这些内容仅在之后单独预览并由你批准的推理请求中，才由本机直发 OpenAI 官方 Responses API。\n");
+    write(stdout, "Continue with ChatGPT：本次只请求身份 scope，不会启用 ChatGPT plan 推理。OpenAI 官方 OAuth 会处理账户标识、返回的基本资料（如 email/name）、授权 scopes 与令牌；本机运行的 Coda 进程会接收 OAuth 回调、处理授权并将 SIWC 凭据保存在你控制的本机配置目录，凭据不会发送到 Coda 远端服务。本次身份登录不会发送任务或仓库文本；这些内容仅在之后单独预览并由你批准的推理请求中，由本机直接发送到 OpenAI 官方 Responses API，不经 Coda 远端代理。\n");
   }
   const needsConsent = Boolean(existing && requestPlanUsage && !planUsageAuthorized(existing));
   const result = await runSiwcAuthorization({
@@ -208,7 +213,7 @@ async function runModels(args: readonly string[], stdout: Writer, storePath: str
   write(stdout, "当前账户模型目录（display_name / slug）：\n");
   if (models.length === 0) write(stdout, "账户目录中没有可展示的模型；未发起推理。\n");
   else for (const model of models) write(stdout, `- ${model.displayName} (${model.slug})\n`);
-  write(stdout, "本目录来自当前所选账户的 /v1/models；ChatGPT plan 使用额度与其他已连接应用共享。\n");
+  write(stdout, `本目录来自当前所选账户的 /v1/models。\n${SIWC_PLAN_USAGE_NOTICE}\n`);
   write(stdout, `Manage usage：${SIWC_USAGE_URL}\n`);
   return 0;
 }

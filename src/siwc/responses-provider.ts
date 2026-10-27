@@ -5,6 +5,7 @@ import { CredentialDurabilityUncertainError } from "./credential-store.js";
 export const SIWC_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
 export const SIWC_MODELS_ENDPOINT = "https://api.openai.com/v1/models";
 export const SIWC_USAGE_URL = "https://chatgpt.com/settings/usage";
+export const SIWC_PLAN_USAGE_NOTICE = "用量/共享规则取决于 ChatGPT plan，本 CLI 无法识别账户方案。OpenAI 当前说明：Plus 的五小时 Work/Codex 限额跨适用应用共享；Pro 100/200/500 当前没有这项五小时限额，但仍有包含额度。还可能另有 app-specific limit；不推断其他额度规则。请查看 Usage 页面了解适用限额。";
 
 export type SiwcModel = Readonly<{ slug: string; displayName: string }>;
 export type ResponseBodyShape = "error-object" | "detail-object" | "object" | "array" | "scalar" | "empty" | "unreadable";
@@ -13,6 +14,7 @@ export class SiwcProviderError extends Error {
   readonly status: number | null;
   readonly code: string | null;
   readonly param: string | null;
+  readonly detail: string | null;
   readonly requestId: string | null;
   readonly bodyShape: ResponseBodyShape | null;
   constructor(input: Readonly<{
@@ -20,6 +22,7 @@ export class SiwcProviderError extends Error {
     status?: number | null;
     code?: string | null;
     param?: string | null;
+    detail?: string | null;
     requestId?: string | null;
     bodyShape?: ResponseBodyShape | null;
   }>) {
@@ -28,6 +31,7 @@ export class SiwcProviderError extends Error {
     this.status = input.status ?? null;
     this.code = input.code ?? null;
     this.param = input.param ?? null;
+    this.detail = input.detail ?? null;
     this.requestId = input.requestId ?? null;
     this.bodyShape = input.bodyShape ?? null;
   }
@@ -37,6 +41,7 @@ export class SiwcProviderError extends Error {
       this.status === null ? null : `HTTP ${this.status}`,
       this.code ? `error.code=${this.code}` : null,
       this.param ? `error.param=${this.param}` : null,
+      this.detail ? `diagnostic detail=${JSON.stringify(this.detail)}` : null,
       this.bodyShape ? `response body shape=${this.bodyShape}` : null,
       this.requestId ? `request ID=${this.requestId}` : null,
     ].filter(Boolean);
@@ -66,18 +71,33 @@ function safeParam(value: unknown): string | null {
   return typeof value === "string" && /^[A-Za-z0-9_.\[\]-]{1,128}$/.test(value) ? value : null;
 }
 
-function errorDetails(body: unknown): Readonly<{ code: string | null; param: string | null }> {
-  if (!isRecord(body)) return { code: null, param: null };
+function safeDiagnosticDetail(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized || normalized.length > 512) return null;
+  const looksSensitive = /\b(?:bearer|access[_ -]?token|refresh[_ -]?token|id[_ -]?token|api[_ -]?key|client[_ -]?secret|password|authorization[_ -]?code|code[_ -]?verifier)\b/i.test(normalized) ||
+    /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(normalized) ||
+    /\b[A-Za-z0-9_-]{24,}\b/.test(normalized) ||
+    /\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/.test(normalized) ||
+    /https?:\/\/\S+/i.test(normalized);
+  if (looksSensitive) return null;
+  return normalized.length > 240 ? `${normalized.slice(0, 239)}…` : normalized;
+}
+
+function errorDetails(body: unknown): Readonly<{ code: string | null; param: string | null; detail: string | null }> {
+  if (!isRecord(body)) return { code: null, param: null, detail: null };
   const response = isRecord(body.response) ? body.response : null;
-  const sources = [
+  const errorObjects = [
     response && isRecord(response.error) ? response.error : null,
     isRecord(body.error) ? body.error : null,
-    isRecord(body.detail) ? body.detail : null,
-    body,
   ].filter((source): source is Record<string, unknown> => source !== null);
   return {
-    code: sources.map((source) => safeCode(source.code)).find((value) => value !== null) ?? null,
-    param: sources.map((source) => safeParam(source.param)).find((value) => value !== null) ?? null,
+    code: errorObjects.map((source) => safeCode(source.code)).find((value) => value !== null) ?? null,
+    param: errorObjects.map((source) => safeParam(source.param)).find((value) => value !== null) ?? null,
+    detail: [
+      typeof body.detail === "string" ? safeDiagnosticDetail(body.detail) : null,
+      ...errorObjects.map((source) => safeDiagnosticDetail(source.detail)),
+    ].find((value) => value !== null) ?? null,
   };
 }
 
@@ -184,10 +204,10 @@ function eventText(body: Record<string, unknown>): string {
 }
 
 function streamFailure(body: Record<string, unknown>, requestId: string | null, status = 200): SiwcProviderError {
-  const { code, param } = errorDetails(body);
+  const { code, param, detail } = errorDetails(body);
   const message = messageForCode(code, param, status) ??
     `SIWC Responses stream ended with ${body.type === "response.incomplete" ? "response.incomplete" : "a provider error"}${code ? ` (${code})` : ""}${param ? ` for parameter ${param}` : ""}; no API-key fallback was used.`;
-  return new SiwcProviderError({ message, status, code, param, requestId });
+  return new SiwcProviderError({ message, status, code, param, detail, requestId });
 }
 
 type ParsedEvent = Readonly<{ type: string; body: Record<string, unknown> }>;
@@ -314,12 +334,13 @@ export async function listSiwcModels(
   }
   if (!response.ok) {
     const body = await safeResponseBody(response);
-    const { code, param } = errorDetails(body.parsed);
+    const { code, param, detail } = errorDetails(body.parsed);
     throw new SiwcProviderError({
       message: messageForStatus(response.status, code, param),
       status: response.status,
       code,
       param,
+      detail,
       requestId: safeRequestId(response.headers),
       bodyShape: body.shape,
     });
@@ -373,12 +394,13 @@ export function createSiwcResponsesProvider(options: SiwcResponsesProviderOption
       const requestId = safeRequestId(response.headers);
       if (!response.ok) {
         const body = await safeResponseBody(response);
-        const { code, param } = errorDetails(body.parsed);
+        const { code, param, detail } = errorDetails(body.parsed);
         throw new SiwcProviderError({
           message: messageForStatus(response.status, code, param),
           status: response.status,
           code,
           param,
+          detail,
           requestId,
           bodyShape: body.shape,
         });
