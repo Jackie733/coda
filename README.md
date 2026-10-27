@@ -1,4 +1,6 @@
-# Minimal Agent：TypeScript + Hono
+# Coda：TypeScript + Hono
+
+[GitHub 仓库：Jackie733/coda](https://github.com/Jackie733/coda)
 
 一个可直接运行的工具型 Agent API 示例。Hono 提供 HTTP 接口，模型通过 OpenAI 兼容的 Chat Completions API 响应；服务端只执行明确列入白名单的工具，不会把模型生成的代码当作程序运行。
 
