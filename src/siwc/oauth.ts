@@ -37,7 +37,8 @@ export class SiwcAuthorizationError extends Error {
   readonly requestId?: string;
   readonly code?: string;
   readonly bodyShape?: string;
-  constructor(message: string, details: { status?: number; requestId?: string; code?: string; bodyShape?: string } = {}) {
+  readonly issuedClientId?: string;
+  constructor(message: string, details: { status?: number; requestId?: string; code?: string; bodyShape?: string; issuedClientId?: string } = {}) {
     const diagnostics = [
       details.status === undefined ? null : `HTTP ${details.status}`,
       details.code ? `OAuth error=${details.code}` : null,
@@ -50,6 +51,7 @@ export class SiwcAuthorizationError extends Error {
     this.requestId = details.requestId;
     this.code = details.code;
     this.bodyShape = details.bodyShape;
+    this.issuedClientId = details.issuedClientId;
   }
 }
 
@@ -109,6 +111,10 @@ export function safeSiwcAuthorizationErrorText(error: SiwcAuthorizationError, fa
   if (error.requestId && isSafeSiwcRequestId(error.requestId)) allowlistedLiterals.push(`request ID=${error.requestId}`);
   if (error.code && OAUTH_ERROR_CODES.has(error.code)) allowlistedLiterals.push(`OAuth error=${error.code}`);
   if (error.bodyShape && OAUTH_BODY_SHAPES.has(error.bodyShape)) allowlistedLiterals.push(`response body shape=${error.bodyShape}`);
+  // Only this exact validated callback-issued field is public protocol data; all other message text stays scanned.
+  if (error.code === "invalid_grant" && error.issuedClientId && isSafeIssuedClientId(error.issuedClientId) && error.message.includes(error.issuedClientId)) {
+    allowlistedLiterals.push(error.issuedClientId);
+  }
   return safeCliErrorText(error.message, fallback, allowlistedLiterals);
 }
 
@@ -459,6 +465,7 @@ export async function runSiwcAuthorization(options: AuthorizationOptions): Promi
         requestId: safeSiwcRequestId(tokenResponse.headers) ?? undefined,
         code,
         bodyShape: oauthBodyShape(errorBody),
+        ...(code === "invalid_grant" && isSafeIssuedClientId(callback.clientId) ? { issuedClientId: callback.clientId } : {}),
       });
     }
     const tokens: unknown = await tokenResponse.json().catch(() => null);

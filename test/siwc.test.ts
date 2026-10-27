@@ -35,6 +35,7 @@ import {
   SIWC_TOKEN_ENDPOINT,
   verifySiwcIdToken,
 } from "../src/siwc/oauth.js";
+import { isSafeSiwcRequestId } from "../src/siwc/request-id.js";
 import {
   createSiwcResponsesProvider,
   listSiwcModels,
@@ -49,6 +50,7 @@ import { readSiwcTuiStatus } from "../src/siwc/ui-status.js";
 import { runSiwcCli } from "../src/siwc-cli.js";
 
 const ISSUED_CLIENT_ID = "oaiapp_synthetic_client";
+const NORMAL_REQUEST_ID = "req_0123456789abcdef0123456789ab";
 const CALLBACK_ACCESS_TOKEN = "synthetic-access-token-never-log";
 const CALLBACK_REFRESH_TOKEN = "synthetic-refresh-token-never-log";
 const FULL_SCOPES = [...SIWC_IDENTITY_SCOPES, ...SIWC_PLAN_SCOPES];
@@ -624,7 +626,7 @@ test("valid consent denial stops before token exchange and does not save an acco
   });
 });
 
-test("OAuth authorization error formatter sanitizes the final message and allowlists only strict request IDs", () => {
+test("OAuth authorization error formatter sanitizes the final message and narrowly preserves validated request and client IDs", () => {
   const fallback = "SIWC 操作失败；为保护凭据，错误详情已隐藏。";
   const maliciousRequestId = "sk-proj-syntheticsecret1234567890";
   const tokenBearingError = new SiwcAuthorizationError(`Synthetic provider failure ${maliciousRequestId}`, {
@@ -635,7 +637,7 @@ test("OAuth authorization error formatter sanitizes the final message and allowl
   });
   assert.equal(safeSiwcAuthorizationErrorText(tokenBearingError, fallback), fallback);
 
-  const requestId = "req_0123456789abcdef0123456789ab";
+  const requestId = NORMAL_REQUEST_ID;
   const safeError = new SiwcAuthorizationError("OpenAI refused this authorization attempt; start a fresh authorization.", {
     status: 400,
     requestId,
@@ -648,6 +650,39 @@ test("OAuth authorization error formatter sanitizes the final message and allowl
   assert.match(text, /response body shape=error-object/);
   assert.match(text, new RegExp(`request ID=${requestId}`));
   assert.match(text, /start a fresh authorization/);
+
+  const longIssuedClientId = `oaiapp_${"a".repeat(33)}`;
+  const recoveryText = `issued client ID 为 ${longIssuedClientId}; npm run siwc -- login --client-id ${longIssuedClientId}`;
+  const structuredClientIdError = new SiwcAuthorizationError(recoveryText, {
+    code: "invalid_grant",
+    issuedClientId: longIssuedClientId,
+  });
+  assert.equal(longIssuedClientId.length, 40);
+  assert.equal(safeSiwcAuthorizationErrorText(structuredClientIdError, fallback), `${recoveryText}\n诊断信息：OAuth error=invalid_grant`);
+
+  const clientIdWithUntrustedText = new SiwcAuthorizationError(`${recoveryText} ${CALLBACK_ACCESS_TOKEN}`, {
+    code: "invalid_grant",
+    issuedClientId: longIssuedClientId,
+  });
+  assert.equal(safeSiwcAuthorizationErrorText(clientIdWithUntrustedText, fallback), fallback);
+
+  const clientIdWithMaliciousRequestId = new SiwcAuthorizationError(`${recoveryText}; request ID=${maliciousRequestId}`, {
+    requestId: maliciousRequestId,
+    code: "invalid_grant",
+    issuedClientId: longIssuedClientId,
+  });
+  assert.equal(safeSiwcAuthorizationErrorText(clientIdWithMaliciousRequestId, fallback), fallback);
+});
+
+test("SIWC request-ID validation accepts only the project's current 32-character lowercase-hex req_ shape", () => {
+  const normalRequestId = NORMAL_REQUEST_ID;
+  assert.equal(normalRequestId.length, 32);
+  assert.equal(isSafeSiwcRequestId(normalRequestId), true);
+  assert.equal(isSafeSiwcRequestId(`req_${"a".repeat(40)}`), false);
+  assert.equal(isSafeSiwcRequestId(`req_${"g".repeat(28)}`), false);
+  assert.equal(isSafeSiwcRequestId("req-short"), false);
+  assert.equal(isSafeSiwcRequestId("req_sk-proj-syntheticsecret1234567890"), false);
+  assert.equal(isSafeSiwcRequestId("req_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature_12345678"), false);
 });
 
 test("reauth without callback client_id uses the pending issued ID in token exchange and maps OAuth errors safely", async () => {
@@ -664,7 +699,7 @@ test("reauth without callback client_id uses the pending issued ID in token exch
   for (const item of cases) {
     await withTemporaryStore(async (storePath, root) => {
       await initializedStore(storePath);
-      const requestId = "req_0123456789abcdef0123456789ab";
+      const requestId = NORMAL_REQUEST_ID;
       const secretDescription = `synthetic token-bearing description ${CALLBACK_ACCESS_TOKEN}`;
       const mocks = makeAuthorizationMocks({
         ...(item.code === "invalid_grant" ? { omitCallbackClientId: true } : {}),
@@ -769,9 +804,14 @@ test("OAuth discovery, JWKS, and token-exchange failures sanitize request IDs th
 
 test("first-registration invalid_grant reauthorizes with the issued client ID and a fresh authorization code", async () => {
   await withTemporaryStore(async (storePath, root) => {
+    const issuedClientId = `oaiapp_${"a".repeat(33)}`;
+    const maliciousRequestId = "sk-proj-syntheticsecret1234567890";
+    const secretDescription = `synthetic private token detail ${CALLBACK_ACCESS_TOKEN}`;
+    assert.equal(issuedClientId.length, 40);
     const first = makeAuthorizationMocks({
       callbackCode: "synthetic-old-authorization-code",
-      tokenError: { code: "invalid_grant", status: 400 },
+      callbackClientId: issuedClientId,
+      tokenError: { code: "invalid_grant", status: 400, requestId: maliciousRequestId, description: secretDescription },
     });
     const firstOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
     const env = { XDG_CONFIG_HOME: path.join(root, "config") };
@@ -785,19 +825,27 @@ test("first-registration invalid_grant reauthorizes with the issued client ID an
     const firstAuthorization = first.getAuthorizationUrl();
     assert.ok(firstAuthorization);
     assert.equal(firstAuthorization.searchParams.get("client_id"), "dynamic_agent_client");
-    assert.equal(first.getTokenBody()?.get("client_id"), ISSUED_CLIENT_ID);
+    assert.equal(first.getTokenBody()?.get("client_id"), issuedClientId);
     assert.equal(first.getTokenBody()?.get("code"), "synthetic-old-authorization-code");
     assert.equal(first.getTokenExchangeCount(), 1);
-    assert.ok(firstOutput.value.includes(`issued client ID 为 ${ISSUED_CLIENT_ID}`));
-    assert.match(firstOutput.value, new RegExp(`npm run siwc -- login --plan-usage --client-id ${ISSUED_CLIENT_ID}`));
+    assert.match(firstOutput.value, /HTTP 400/);
+    assert.match(firstOutput.value, /OAuth error=invalid_grant/);
+    assert.match(firstOutput.value, /response body shape=error-object/);
+    assert.ok(firstOutput.value.includes(`issued client ID 为 ${issuedClientId}`));
+    assert.match(firstOutput.value, new RegExp(`npm run siwc -- login --plan-usage --client-id ${issuedClientId}`));
     assert.match(firstOutput.value, /丢弃本次 authorization code，不要再次提交或复用该 code/);
-    assert.doesNotMatch(firstOutput.value, /synthetic-old-authorization-code/);
+    assert.match(firstOutput.value, /不会再次使用 dynamic_agent_client 注册/);
+    assert.doesNotMatch(firstOutput.value, /synthetic-old-authorization-code|request ID=|sk-proj-syntheticsecret1234567890|synthetic-access-token-never-log|synthetic private token detail/);
     assert.equal((await readSiwcCredentialStore(storePath))?.accounts.length, 0);
 
-    const retry = makeAuthorizationMocks({ callbackCode: "synthetic-fresh-authorization-code" });
+    const retry = makeAuthorizationMocks({
+      callbackCode: "synthetic-fresh-authorization-code",
+      callbackClientId: issuedClientId,
+      tokenClaims: { aud: issuedClientId },
+    });
     const retryOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
     assert.equal(await runSiwcCli({
-      argv: ["login", "--plan-usage", "--client-id", ISSUED_CLIENT_ID],
+      argv: ["login", "--plan-usage", "--client-id", issuedClientId],
       env,
       stdout: retryOutput,
       fetchImpl: retry.fetchImpl,
@@ -805,14 +853,14 @@ test("first-registration invalid_grant reauthorizes with the issued client ID an
     }), 0);
     const retryAuthorization = retry.getAuthorizationUrl();
     assert.ok(retryAuthorization);
-    assert.equal(retryAuthorization.searchParams.get("client_id"), ISSUED_CLIENT_ID);
+    assert.equal(retryAuthorization.searchParams.get("client_id"), issuedClientId);
     assert.notEqual(retryAuthorization.searchParams.get("client_id"), "dynamic_agent_client");
     assert.equal(retryAuthorization.searchParams.has("agent_name_hint"), false);
-    assert.equal(retry.getTokenBody()?.get("client_id"), ISSUED_CLIENT_ID);
+    assert.equal(retry.getTokenBody()?.get("client_id"), issuedClientId);
     assert.equal(retry.getTokenBody()?.get("code"), "synthetic-fresh-authorization-code");
     assert.notEqual(retry.getTokenBody()?.get("code"), first.getTokenBody()?.get("code"));
     assert.equal(retry.getTokenExchangeCount(), 1);
-    assert.equal((await readSiwcCredentialStore(storePath))?.accounts[0]?.clientId, ISSUED_CLIENT_ID);
+    assert.equal((await readSiwcCredentialStore(storePath))?.accounts[0]?.clientId, issuedClientId);
   });
 });
 
@@ -1257,7 +1305,7 @@ test("Responses provider sends only the documented public SSE request and succee
       receivedBody = String(init?.body);
       return new Response(
         sseEvent("response.output_text.delta", { delta: modelText }) + sseEvent("response.completed", { response: { output: [] } }),
-        { status: 200, headers: { "Content-Type": "text/event-stream", "openai-request-id": "synthetic-request-1" } },
+        { status: 200, headers: { "Content-Type": "text/event-stream", "openai-request-id": NORMAL_REQUEST_ID } },
       );
     },
   });
@@ -1511,7 +1559,7 @@ test("all official SIWC Responses error codes retain code/param and actionable r
     { code: "subscription_sharing_user_unavailable", status: 503, expected: /preserve credentials and retry later with bounded backoff/i },
   ] as const;
   for (const item of cases) {
-    const requestId = `synthetic-${item.code}`;
+    const requestId = NORMAL_REQUEST_ID;
     const privateMessage = `synthetic private response text ${item.code}`;
     const provider = createSiwcResponsesProvider({
       getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
@@ -1564,14 +1612,14 @@ test("usage-limit stream errors never become success and point to shared plan us
     fetchImpl: async () => new Response(
       sseEvent("response.output_text.delta", { delta: "partial synthetic text" }) +
       sseEvent("response.failed", { response: { error: { code: "subscription_sharing_usage_limit_exceeded", message: "synthetic only" } } }),
-      { status: 200, headers: { "Content-Type": "text/event-stream", "x-request-id": "synthetic-stream-id" } },
+      { status: 200, headers: { "Content-Type": "text/event-stream", "x-request-id": NORMAL_REQUEST_ID } },
     ),
   });
   await assert.rejects(provider.send(responsesRequest()), (error: unknown) => {
     assert.ok(error instanceof SiwcProviderError);
     assert.equal(error.code, "subscription_sharing_usage_limit_exceeded");
     assert.equal(error.status, 200);
-    assert.equal(error.requestId, "synthetic-stream-id");
+    assert.equal(error.requestId, NORMAL_REQUEST_ID);
     assert.match(error.message, /usage limit was reached/i);
     assert.match(error.message, /cannot distinguish an app-specific limit from a shared plan limit/i);
     assert.match(error.message, /does not indicate a reset time/i);
@@ -1583,7 +1631,7 @@ test("usage-limit stream errors never become success and point to shared plan us
 });
 
 test("SSE terminal failures expose only whitelisted structured diagnostics", async () => {
-  const requestId = "req_0123456789abcdef0123456789ab";
+  const requestId = NORMAL_REQUEST_ID;
   const secret = "synthetic-access-token-never-log";
   const rawMessage = `private provider message ${secret}`;
   const rawDetail = "unfiltered provider detail must not be echoed";
@@ -1689,18 +1737,18 @@ test("a stream without response.completed fails and direct-admission detail text
     detailText: string;
     expectedDetail: string | null;
   }> = [
-    { status: 401, requestId: "synthetic-admission-401", code: "admission_denied", param: "scopes", detailText: "Selected region does not permit this request.", expectedDetail: "Selected region does not permit this request." },
-    { status: 403, requestId: "synthetic-admission-403", unsafeParam: "bad\nsynthetic-injected-param-secret", detailText: `Denied: Bearer ${CALLBACK_ACCESS_TOKEN}`, expectedDetail: null },
-    { status: 503, requestId: "synthetic-admission-503", code: "route_temporarily_unavailable", detailText: "temporary route failure", expectedDetail: "temporary route failure" },
-    { status: 403, requestId: "synthetic-admission-nested-detail", code: "chatpass_v2_scope_not_authorized", param: "resource.invoke", nestedDetail: true, detailText: "nested private detail", expectedDetail: null },
-    { status: 401, requestId: "synthetic-admission-detail-code", detailText: "invalid_grant", expectedDetail: "invalid_grant" },
-    { status: 403, requestId: "synthetic-admission-control", detailText: "policy\ndenied", expectedDetail: "policy denied" },
-    { status: 403, requestId: "synthetic-admission-bidi", detailText: `safe-before ${String.fromCodePoint(0x202e)} spoofed-after ${String.fromCodePoint(0x2066)} left ${String.fromCodePoint(0x2067)} right ${String.fromCodePoint(0x2068)} first ${String.fromCodePoint(0x2069)} done`, expectedDetail: "safe-before \\u202E spoofed-after \\u2066 left \\u2067 right \\u2068 first \\u2069 done" },
-    { status: 403, requestId: "synthetic-admission-bidi-sensitive", detailText: `synthetic access${String.fromCodePoint(0x202e)}_token must-not-display`, expectedDetail: null },
-    { status: 403, requestId: "req-short", detailText: "provider failed: acce\u200Ess_token: abc12345", expectedDetail: null },
-    { status: 403, requestId: "synthetic-admission-bidi-long", detailText: `abcdefghijklmnop${String.fromCodePoint(0x202e)}qrstuvwxyzABCDEF`, expectedDetail: null },
-    { status: 403, requestId: "synthetic-admission-bidi-url", detailText: `https:${String.fromCodePoint(0x202e)}//synthetic.example/credential`, expectedDetail: null },
-    { status: 403, requestId: "synthetic-admission-length", detailText: "diagnostic text ".repeat(30), expectedDetail: `${"diagnostic text ".repeat(30).slice(0, 239)}…` },
+    { status: 401, requestId: NORMAL_REQUEST_ID, code: "admission_denied", param: "scopes", detailText: "Selected region does not permit this request.", expectedDetail: "Selected region does not permit this request." },
+    { status: 403, requestId: NORMAL_REQUEST_ID, unsafeParam: "bad\nsynthetic-injected-param-secret", detailText: `Denied: Bearer ${CALLBACK_ACCESS_TOKEN}`, expectedDetail: null },
+    { status: 503, requestId: NORMAL_REQUEST_ID, code: "route_temporarily_unavailable", detailText: "temporary route failure", expectedDetail: "temporary route failure" },
+    { status: 403, requestId: NORMAL_REQUEST_ID, code: "chatpass_v2_scope_not_authorized", param: "resource.invoke", nestedDetail: true, detailText: "nested private detail", expectedDetail: null },
+    { status: 401, requestId: NORMAL_REQUEST_ID, detailText: "invalid_grant", expectedDetail: "invalid_grant" },
+    { status: 403, requestId: NORMAL_REQUEST_ID, detailText: "policy\ndenied", expectedDetail: "policy denied" },
+    { status: 403, requestId: NORMAL_REQUEST_ID, detailText: `safe-before ${String.fromCodePoint(0x202e)} spoofed-after ${String.fromCodePoint(0x2066)} left ${String.fromCodePoint(0x2067)} right ${String.fromCodePoint(0x2068)} first ${String.fromCodePoint(0x2069)} done`, expectedDetail: "safe-before \\u202E spoofed-after \\u2066 left \\u2067 right \\u2068 first \\u2069 done" },
+    { status: 403, requestId: NORMAL_REQUEST_ID, detailText: `synthetic access${String.fromCodePoint(0x202e)}_token must-not-display`, expectedDetail: null },
+    { status: 403, requestId: NORMAL_REQUEST_ID, detailText: "provider failed: acce\u200Ess_token: abc12345", expectedDetail: null },
+    { status: 403, requestId: NORMAL_REQUEST_ID, detailText: `abcdefghijklmnop${String.fromCodePoint(0x202e)}qrstuvwxyzABCDEF`, expectedDetail: null },
+    { status: 403, requestId: NORMAL_REQUEST_ID, detailText: `https:${String.fromCodePoint(0x202e)}//synthetic.example/credential`, expectedDetail: null },
+    { status: 403, requestId: NORMAL_REQUEST_ID, detailText: "diagnostic text ".repeat(30), expectedDetail: `${"diagnostic text ".repeat(30).slice(0, 239)}…` },
   ];
   for (const item of admissionCases) {
     const providedParam = item.param ?? ("unsafeParam" in item ? item.unsafeParam : undefined);
@@ -1753,7 +1801,7 @@ test("readonly CLI suppresses a U+200E-obfuscated short token from the built-in 
       responseCalls += 1;
       assert.equal(String(input), SIWC_RESPONSES_ENDPOINT);
       assert.equal(init?.method, "POST");
-      return Response.json({ detail }, { status: 403, headers: { "openai-request-id": "synthetic-u200e-403" } });
+      return Response.json({ detail }, { status: 403, headers: { "openai-request-id": NORMAL_REQUEST_ID } });
     },
   });
 
@@ -1777,13 +1825,13 @@ test("readonly CLI suppresses a U+200E-obfuscated short token from the built-in 
   assert.equal(responseCalls, 1);
   assert.equal(fallbackCalls, 0);
   assert.match(output.value, /HTTP 403/);
-  assert.match(output.value, /request ID=synthetic-u200e-403/);
+  assert.match(output.value, new RegExp(`request ID=${NORMAL_REQUEST_ID}`));
   assert.doesNotMatch(output.value, /abc12345|\u200e|access_token/);
   assert.doesNotMatch(output.value, /API-key fallback must not run/);
 });
 
 test("readonly CLI preserves usage-limit guidance with a validated 32-character request ID while hiding a bidi-interleaved short credential", async () => {
-  const requestId = "req_0123456789abcdef0123456789ab";
+  const requestId = NORMAL_REQUEST_ID;
   const detail = "provider failed: acce\u200Ess_token: abc12345";
   assert.equal(requestId.length, 32);
   assert.ok(detail.includes("\u200e"));
@@ -1838,6 +1886,7 @@ test("readonly CLI rejects secret-like request ID headers without hiding mapped 
     "sk-proj-syntheticsecret1234567890",
     "Bearer-secretvalue0123456789abcdef",
     "token-secretvalue0123456789abcdef",
+    `req_${"a".repeat(40)}`,
     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature_12345678",
     "req_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature_12345678",
     "0123456789abcdef0123456789abcdef",
