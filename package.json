@@ -9,6 +9,7 @@
     "start": "tsx src/index.ts",
     "inspect": "tsx src/cli.ts",
     "patch": "tsx src/patch.ts",
+    "siwc": "tsx src/siwc-cli.ts",
     "tui": "tsx src/tui.ts",
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts"
@@ -16,7 +17,8 @@
   "dependencies": {
     "@hono/node-server": "^1.19.5",
     "dotenv": "^16.6.1",
-    "hono": "^4.10.4"
+    "hono": "^4.10.4",
+    "jose": "^6.2.13"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

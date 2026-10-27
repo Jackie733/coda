@@ -13,6 +13,7 @@
 - 请求体限制为 16 KB，并对消息长度、模型等待时间、工具调用总数和模型往返轮数设置上限。
 - 通过依赖注入隔离 HTTP 服务启动和 Agent 应用，方便用自动化测试验证错误路径与工具调用。
 - `npm run inspect`：本地只读代码理解原型；在发送前预览完整请求并要求明确确认。
+- `npm run siwc -- ...`：可选的本机 Sign in with ChatGPT（SIWC）身份/ChatGPT-plan provider；与 API-key 计费路径分开，不会互相兜底。
 
 ## 运行
 
@@ -75,6 +76,30 @@ CLI 先显示当前 `HEAD`、具体计划和精确文件范围；输入 `yes` �
 
 模型只返回结构化文本替换（`oldText` / `newText`），每项必须带理由和引用；CLI 会拒绝不在白名单内的路径、遍历/绝对路径、符号链接、`.git`/秘密路径、重复或不唯一的文本匹配、无效引用、控制字符和疑似凭据。为避免 Git pathspec 将批准路径展开为模式，文件名仅支持 ASCII 字母/数字及 `.`、`_`、`-`、`+`、`@` 字符。CLI 先创建不检出内容的 detached Git linked worktree，再用固定 HEAD 初始化隔离 index，并只通过 `checkout-index` 物化批准的精确文件；不启用 sparse checkout，也不改写共享 `.git/config`。源工作树中的秘密或其他文件不会复制到临时目录。创建/检出期间会禁用仓库自定义 Git hooks 与 clean/smudge/process filters。补丁只写进该隔离工作树，不运行 shell、模型建议的命令、测试或仓库脚本，也不会提交、推送、创建 PR 或合并。应用后会显示隔离工作树相对基准的完整 diff，再由用户输入 `keep` 保留该工作树供检查，或输入 `discard` 丢弃；非交互模式默认丢弃。失败或取消时 CLI 不会声称补丁成功，并报告隔离工作树是否仍然存在，但父临时目录删除失败可能没有单独报告（见 [issue #6](https://github.com/Jackie733/coda/issues/6)）。保留结果只是本地未提交的候选补丁，不代表独立 QA 已通过。
 
+## 可选 SIWC / ChatGPT plan provider（本机、明确授权）
+
+该 provider 只供用户在本人本机运行的开源 Coda 使用；它不是通用代理，不用于共享、转让、轮换或代他人消耗计划额度，也没有 Coda paywall。付费或远程托管服务若要接入 SIWC，必须先取得 OpenAI 要求的批准。登录只会打开 OpenAI 官方 SIWC 授权流程；不要提供 ChatGPT 密码/cookie，也不会读取浏览器会话或 Codex 私有缓存。
+
+```bash
+# 只登录身份，不请求计划推理授权
+npm run siwc -- login
+
+# 明确请求 ChatGPT plan 用量；需要在 OpenAI 官方授权页同意
+npm run siwc -- login --plan-usage
+
+# 查看脱敏状态、当前账户模型，执行只读 inspect 或退出
+npm run siwc -- status
+npm run siwc -- models
+npm run siwc -- inspect --model <从 models 返回的 slug> "请说明入口与安全边界"
+npm run siwc -- logout
+```
+
+只有 `login --plan-usage` 才请求 `chatgpt.tokens.use.direct`（以及官方流程所需的资源/刷新 scopes）；身份登录或缺少实际授予的 plan-use scope 都不能发起计划推理。首次动态注册后，必须用授权回调签发的 client ID；多账户可用 `status` 查看并用 `select <issued-client-id>` 切换。模型列表来自所选账户当前可见的官方 `/v1/models` 目录，交互终端可选择，非交互终端须显式传 `--model`。
+
+`inspect` 会先按现有只读流程收集有限的已跟踪源码，展示最终 Responses JSON 和模型，然后要求逐次确认；只有批准后才会以所选账户的 SIWC access token 请求公开的 Responses API。请求设为 `store:false`、`stream:true`，只有收到 `response.completed` 才算成功；不使用 ChatGPT 内部 backend API。SIWC 请求从不读取 API key、不走 Hono `/agent`，失败也不会切换 API-key provider。OpenAI API key 与 ChatGPT plan/credits 是两种独立计费方式。
+
+ChatGPT 计划额度可能与其他已连接应用共享；查看或管理用量：[chatgpt.com/settings/usage](https://chatgpt.com/settings/usage)。遇到额度上限时会停止该次 plan 请求并给出管理入口，不会静默改用 API key。`status` 不展示 token；Unix 配置目录权限为 `0700`、凭据文件权限为 `0600`，支持 refresh-token 轮换与 logout 撤销。由于当前版本未验证 Windows owner-only ACL，SIWC 凭据读取/写入在 Windows 上会 fail closed（其他本机 CLI/TUI 功能不受影响）。CI 只使用 mock OAuth/token/model endpoints 和 synthetic repository/prompt；不会自动运行真实账户或模型 smoke。
+
 ## 调用示例
 
 ```bash
@@ -115,6 +140,7 @@ npm test
 
 - `src/app.ts`：路由、输入校验、模型交互循环和白名单工具。
 - `src/index.ts`：读取环境变量并启动 Node.js HTTP 服务。
+- `src/siwc/` 与 `src/siwc-cli.ts`：本机 SIWC OAuth、凭据存储、计划用量 Responses provider 与显式命令入口。
 - `test/app.test.ts`：接口、工具和错误路径测试。
 - `SECURITY.md`：M0/M1 安全边界、威胁模型与同 UID 范围外说明。
 - `.env.example`：环境变量模板。

@@ -1,0 +1,452 @@
+import { createServer, type Server } from "node:http";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  createLocalJWKSet,
+  jwtVerify,
+  type JSONWebKeySet,
+  type JWTPayload,
+} from "jose";
+import {
+  ensureSiwcCredentialStore,
+  saveSiwcAccount,
+  SIWC_PLAN_SCOPE,
+  SIWC_REFRESH_SCOPE,
+  SIWC_RESOURCE_SCOPE,
+  type SiwcAccountRecord,
+  type SiwcCredentialStore,
+  resolveSiwcStorePath,
+} from "./credential-store.js";
+
+export const SIWC_ISSUER = "https://auth.openai.com";
+export const SIWC_DISCOVERY_URL = `${SIWC_ISSUER}/.well-known/openid-configuration`;
+export const SIWC_AUTHORIZATION_ENDPOINT = `${SIWC_ISSUER}/api/accounts/authorize`;
+export const SIWC_TOKEN_ENDPOINT = `${SIWC_ISSUER}/api/accounts/oauth/token`;
+export const SIWC_RESOURCE = "https://api.openai.com/v1";
+export const SIWC_CALLBACK_PATH = "/auth/callback";
+export const SIWC_IDENTITY_SCOPES = Object.freeze(["openid", "profile", "email"]);
+export const SIWC_PLAN_SCOPES = Object.freeze([
+  "offline_access",
+  "resource.invoke",
+  "chatgpt.tokens.use.direct",
+]);
+
+export class SiwcAuthorizationError extends Error {
+  readonly status?: number;
+  readonly requestId?: string;
+  constructor(message: string, details: { status?: number; requestId?: string } = {}) {
+    super(message);
+    this.name = "SiwcAuthorizationError";
+    this.status = details.status;
+    this.requestId = details.requestId;
+  }
+}
+
+export type OidcConfiguration = Readonly<{
+  issuer: string;
+  authorization_endpoint: string;
+  token_endpoint: string;
+  revocation_endpoint: string;
+  jwks_uri: string;
+}>;
+
+type CallbackResult = Readonly<{ code: string; clientId: string }>;
+type Listener = Readonly<{
+  redirectUri: string;
+  result: Promise<CallbackResult>;
+  close: () => Promise<void>;
+}>;
+
+type IdentityClaims = JWTPayload & Readonly<{
+  sub: string;
+  email?: string;
+  name?: string;
+}>;
+
+export type AuthorizationResult = Readonly<{
+  account: SiwcAccountRecord;
+  planUsageAuthorized: boolean;
+  reusedClientId: boolean;
+}>;
+
+export type AuthorizationOptions = Readonly<{
+  storePath?: string;
+  existingClientId?: string;
+  requestPlanUsage: boolean;
+  promptConsent?: boolean;
+  fetchImpl?: typeof fetch;
+  openBrowser: (authorizationUrl: string) => Promise<void>;
+  timeoutMs?: number;
+}>;
+
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeRequestId(headers: Headers): string | undefined {
+  const value = headers.get("openai-request-id") ?? headers.get("x-request-id");
+  return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : undefined;
+}
+
+function formBody(entries: Record<string, string>): URLSearchParams {
+  const body = new URLSearchParams();
+  for (const [key, value] of Object.entries(entries)) body.set(key, value);
+  return body;
+}
+
+export function createPkceValues(): Readonly<{ state: string; nonce: string; verifier: string; challenge: string }> {
+  const state = randomBytes(32).toString("base64url");
+  const nonce = randomBytes(32).toString("base64url");
+  const verifier = randomBytes(64).toString("base64url");
+  const challenge = createHash("sha256").update(verifier, "ascii").digest("base64url");
+  return Object.freeze({ state, nonce, verifier, challenge });
+}
+
+export function buildSiwcAuthorizationUrl(input: Readonly<{
+  clientId: string;
+  hostId: string;
+  redirectUri: string;
+  state: string;
+  nonce: string;
+  codeChallenge: string;
+  requestPlanUsage: boolean;
+  existingAccount?: Pick<SiwcAccountRecord, "idToken" | "email">;
+  promptConsent?: boolean;
+}>): string {
+  const url = new URL(SIWC_AUTHORIZATION_ENDPOINT);
+  const isNewRegistration = input.clientId === "dynamic_agent_client";
+  const scopes = input.requestPlanUsage
+    ? [...SIWC_IDENTITY_SCOPES, ...SIWC_PLAN_SCOPES]
+    : [...SIWC_IDENTITY_SCOPES];
+  url.search = new URLSearchParams({
+    client_id: input.clientId,
+    ...(isNewRegistration ? { agent_name_hint: "Coda" } : {}),
+    ext_agent_host_id: input.hostId,
+    response_type: "code",
+    redirect_uri: input.redirectUri,
+    scope: scopes.join(" "),
+    resource: SIWC_RESOURCE,
+    state: input.state,
+    nonce: input.nonce,
+    code_challenge_method: "S256",
+    code_challenge: input.codeChallenge,
+    ...(input.existingAccount?.idToken ? { id_token_hint: input.existingAccount.idToken } : {}),
+    ...(input.existingAccount?.email ? { login_hint: input.existingAccount.email } : {}),
+    ...(input.promptConsent ? { prompt: "consent" } : {}),
+  }).toString();
+  return url.toString();
+}
+
+function oneQueryValue(url: URL, key: string): string | null {
+  const values = url.searchParams.getAll(key);
+  if (values.length > 1) throw new SiwcAuthorizationError("SIWC 回调参数重复；请重新开始登录。");
+  return values[0] ?? null;
+}
+
+function equalState(received: string | null, expected: string): boolean {
+  if (received === null) return false;
+  const left = Buffer.from(received, "utf8");
+  const right = Buffer.from(expected, "utf8");
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+async function startLoopbackListener(
+  state: string,
+  expectedClientId: string | null,
+  timeoutMs: number,
+): Promise<Listener> {
+  let resolveResult!: (result: CallbackResult) => void;
+  let rejectResult!: (error: unknown) => void;
+  let settled = false;
+  let timeout: NodeJS.Timeout | undefined;
+  const result = new Promise<CallbackResult>((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+  void result.catch(() => undefined);
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    if (timeout) clearTimeout(timeout);
+    callback();
+  };
+
+  const server: Server = createServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (request.method !== "GET" || url.pathname !== SIWC_CALLBACK_PATH) {
+      response.writeHead(404, { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" }).end("Not found.");
+      return;
+    }
+    let returnedState: string | null;
+    let oauthError: string | null;
+    let code: string | null;
+    let returnedClientId: string | null;
+    try {
+      returnedState = oneQueryValue(url, "state");
+      oauthError = oneQueryValue(url, "error");
+      code = oneQueryValue(url, "code");
+      returnedClientId = oneQueryValue(url, "client_id");
+    } catch {
+      response.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" }).end("Sign-in could not be verified. You may close this window.");
+      finish(() => rejectResult(new SiwcAuthorizationError("SIWC 回调参数无效；未兑换授权码。")));
+      return;
+    }
+
+    if (!equalState(returnedState, state)) {
+      response.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" }).end("Sign-in could not be verified. You may close this window.");
+      return;
+    }
+    if (oauthError) {
+      response.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" }).end("Sign-in was not completed. You may close this window.");
+      finish(() => rejectResult(new SiwcAuthorizationError(
+        oauthError === "access_denied" ? "用户拒绝了 SIWC 授权；未发起推理。" : "SIWC 授权未完成；未发起推理。",
+      )));
+      return;
+    }
+    if (!code || !code.trim()) {
+      response.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" }).end("Sign-in could not be verified. You may close this window.");
+      finish(() => rejectResult(new SiwcAuthorizationError("SIWC 回调缺少授权码；未发起推理。")));
+      return;
+    }
+    if (expectedClientId === null && (!returnedClientId || returnedClientId === "dynamic_agent_client")) {
+      response.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" }).end("Registration could not be verified. You may close this window.");
+      finish(() => rejectResult(new SiwcAuthorizationError("首次 SIWC 注册回调缺少签发的 client ID；未兑换授权码。")));
+      return;
+    }
+    if (expectedClientId !== null && returnedClientId !== null && returnedClientId !== expectedClientId) {
+      response.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" }).end("Account registration did not match. You may close this window.");
+      finish(() => rejectResult(new SiwcAuthorizationError("SIWC 回调 client ID 与所选账户不匹配；未兑换授权码。")));
+      return;
+    }
+    response.writeHead(200, {
+      "Cache-Control": "no-store",
+      "Content-Type": "text/plain; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+    }).end("Sign in with ChatGPT is complete. You may close this window and return to Coda.");
+    finish(() => resolveResult({ code, clientId: expectedClientId ?? returnedClientId! }));
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  }).catch(() => {
+    throw new SiwcAuthorizationError("无法在 127.0.0.1 启动 SIWC 回调监听器；未打开浏览器。 ");
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw new SiwcAuthorizationError("无法确定 SIWC 回环回调端口；未打开浏览器。");
+  }
+  timeout = setTimeout(() => {
+    finish(() => rejectResult(new SiwcAuthorizationError("SIWC 登录等待超时；未发起推理。")));
+  }, timeoutMs);
+  timeout.unref();
+
+  return Object.freeze({
+    redirectUri: `http://127.0.0.1:${address.port}${SIWC_CALLBACK_PATH}`,
+    result,
+    close: async () => {
+      if (timeout) clearTimeout(timeout);
+      if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  });
+}
+
+export async function readSiwcOidcConfiguration(fetchImpl: typeof fetch = fetch): Promise<OidcConfiguration> {
+  let response: Response;
+  try {
+    response = await fetchImpl(SIWC_DISCOVERY_URL, { redirect: "error", signal: AbortSignal.timeout(15_000) });
+  } catch {
+    throw new SiwcAuthorizationError("无法读取 OpenAI 官方 OIDC 配置；请检查网络后重试。");
+  }
+  if (!response.ok) throw new SiwcAuthorizationError("无法读取 OpenAI 官方 OIDC 配置。", { status: response.status, requestId: safeRequestId(response.headers) });
+  const metadata: unknown = await response.json().catch(() => null);
+  if (!record(metadata)) throw new SiwcAuthorizationError("OpenAI 官方 OIDC 配置格式无效。");
+  const endpoints = {
+    issuer: metadata.issuer,
+    authorization_endpoint: metadata.authorization_endpoint,
+    token_endpoint: metadata.token_endpoint,
+    revocation_endpoint: metadata.revocation_endpoint,
+    jwks_uri: metadata.jwks_uri,
+  };
+  if (
+    endpoints.issuer !== SIWC_ISSUER ||
+    endpoints.authorization_endpoint !== SIWC_AUTHORIZATION_ENDPOINT ||
+    endpoints.token_endpoint !== SIWC_TOKEN_ENDPOINT ||
+    typeof endpoints.revocation_endpoint !== "string" ||
+    !endpoints.revocation_endpoint.startsWith(`${SIWC_ISSUER}/`) ||
+    typeof endpoints.jwks_uri !== "string" ||
+    !endpoints.jwks_uri.startsWith(`${SIWC_ISSUER}/`)
+  ) {
+    throw new SiwcAuthorizationError("OpenAI OIDC 元数据与官方 SIWC 端点不匹配；已拒绝继续。");
+  }
+  return endpoints as OidcConfiguration;
+}
+
+export async function verifySiwcIdToken(input: Readonly<{
+  idToken: string;
+  clientId: string;
+  nonce?: string;
+  expectedSubject?: string;
+  fetchImpl?: typeof fetch;
+}>): Promise<IdentityClaims> {
+  const fetchImpl = input.fetchImpl ?? fetch;
+  const configuration = await readSiwcOidcConfiguration(fetchImpl);
+  let jwksResponse: Response;
+  try {
+    jwksResponse = await fetchImpl(configuration.jwks_uri, {
+      redirect: "error",
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    throw new SiwcAuthorizationError("无法读取 OpenAI 官方 JWKS；未保存或使用本次令牌。");
+  }
+  if (!jwksResponse.ok) {
+    throw new SiwcAuthorizationError("无法读取 OpenAI 官方 JWKS。", { status: jwksResponse.status, requestId: safeRequestId(jwksResponse.headers) });
+  }
+  const jwksValue: unknown = await jwksResponse.json().catch(() => null);
+  if (!record(jwksValue) || !Array.isArray(jwksValue.keys)) {
+    throw new SiwcAuthorizationError("OpenAI 官方 JWKS 格式无效；未保存或使用本次令牌。");
+  }
+  let payload: JWTPayload;
+  try {
+    const keySet = createLocalJWKSet(jwksValue as unknown as JSONWebKeySet);
+    const verified = await jwtVerify(input.idToken, keySet, {
+      issuer: configuration.issuer,
+      audience: input.clientId,
+      algorithms: ["RS256"],
+      requiredClaims: ["sub", "exp", "iat"],
+      clockTolerance: 5,
+    });
+    payload = verified.payload;
+  } catch {
+    throw new SiwcAuthorizationError("SIWC ID token 的签名、issuer、audience 或有效期校验失败；未保存或使用本次令牌。");
+  }
+  if (typeof payload.sub !== "string" || !payload.sub) {
+    throw new SiwcAuthorizationError("SIWC ID token 缺少有效 subject；未保存或使用本次令牌。");
+  }
+  if (input.nonce !== undefined && payload.nonce !== input.nonce) {
+    throw new SiwcAuthorizationError("SIWC ID token nonce 不匹配；未保存或使用本次令牌。");
+  }
+  if (input.expectedSubject !== undefined && payload.sub !== input.expectedSubject) {
+    throw new SiwcAuthorizationError("SIWC 账户身份与所选账户不匹配；未覆盖任何已保存凭据。");
+  }
+  return payload as IdentityClaims;
+}
+
+function parseScopes(value: unknown): readonly string[] {
+  if (typeof value !== "string") return Object.freeze([]);
+  return Object.freeze([...new Set(value.split(/\s+/).map((scope) => scope.trim()).filter(Boolean))]);
+}
+
+function validExpiresIn(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 31 * 24 * 60 * 60
+    ? value
+    : null;
+}
+
+export async function runSiwcAuthorization(options: AuthorizationOptions): Promise<AuthorizationResult> {
+  const storePath = options.storePath ?? resolveSiwcStorePath();
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const store: SiwcCredentialStore = await ensureSiwcCredentialStore(storePath);
+  const existing = options.existingClientId
+    ? store.accounts.find((account) => account.clientId === options.existingClientId)
+    : undefined;
+  if (options.existingClientId && !existing) throw new SiwcAuthorizationError("找不到所选的 SIWC client ID；请先运行 `siwc status`。");
+  const pkce = createPkceValues();
+  const listener = await startLoopbackListener(pkce.state, existing?.clientId ?? null, options.timeoutMs ?? 5 * 60_000);
+  try {
+    const authorizationUrl = buildSiwcAuthorizationUrl({
+      clientId: existing?.clientId ?? "dynamic_agent_client",
+      hostId: store.hostId,
+      redirectUri: listener.redirectUri,
+      state: pkce.state,
+      nonce: pkce.nonce,
+      codeChallenge: pkce.challenge,
+      requestPlanUsage: options.requestPlanUsage,
+      ...(existing ? { existingAccount: { idToken: existing.idToken, email: existing.email } } : {}),
+      ...(options.promptConsent ? { promptConsent: true } : {}),
+    });
+    try {
+      await options.openBrowser(authorizationUrl);
+    } catch {
+      throw new SiwcAuthorizationError("无法打开系统浏览器；SIWC 登录已停止，未兑换授权码。");
+    }
+    const callback = await listener.result;
+    const tokenResponse = await fetchImpl(SIWC_TOKEN_ENDPOINT, {
+      method: "POST",
+      redirect: "error",
+      headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
+      body: formBody({
+        grant_type: "authorization_code",
+        code: callback.code,
+        client_id: callback.clientId,
+        code_verifier: pkce.verifier,
+        redirect_uri: listener.redirectUri,
+        resource: SIWC_RESOURCE,
+      }),
+      signal: AbortSignal.timeout(20_000),
+    }).catch(() => {
+      throw new SiwcAuthorizationError("SIWC token 交换失败；授权码未重试，令牌未保存。");
+    });
+    if (!tokenResponse.ok) {
+      throw new SiwcAuthorizationError("SIWC token 交换失败；令牌未保存。", {
+        status: tokenResponse.status,
+        requestId: safeRequestId(tokenResponse.headers),
+      });
+    }
+    const tokens: unknown = await tokenResponse.json().catch(() => null);
+    if (!record(tokens)) throw new SiwcAuthorizationError("SIWC token 响应格式无效；令牌未保存。");
+    if (typeof tokens.token_type !== "string" || tokens.token_type.toLowerCase() !== "bearer" || typeof tokens.id_token !== "string" || !tokens.id_token) {
+      throw new SiwcAuthorizationError("SIWC token 响应缺少有效 Bearer token 或 ID token；令牌未保存。");
+    }
+    const scopes = parseScopes(tokens.scope);
+    const expiresIn = validExpiresIn(tokens.expires_in);
+    const accessToken = typeof tokens.access_token === "string" && tokens.access_token ? tokens.access_token : null;
+    const refreshToken = typeof tokens.refresh_token === "string" && tokens.refresh_token ? tokens.refresh_token : null;
+    if (options.requestPlanUsage && scopes.includes(SIWC_PLAN_SCOPE) && scopes.includes(SIWC_RESOURCE_SCOPE) && (!accessToken || !expiresIn)) {
+      throw new SiwcAuthorizationError("SIWC 已授予 plan-use scope，但 token 响应缺少有效 access token 或过期时间；未保存或推理。");
+    }
+    if (scopes.includes(SIWC_REFRESH_SCOPE) && !refreshToken) {
+      throw new SiwcAuthorizationError("SIWC 授予 offline_access 但未返回 refresh token；为避免无法安全续期，本次凭据未保存。");
+    }
+    const claims = await verifySiwcIdToken({
+      idToken: tokens.id_token,
+      clientId: callback.clientId,
+      nonce: pkce.nonce,
+      ...(existing ? { expectedSubject: existing.subject } : {}),
+      fetchImpl,
+    });
+    const grantedPlanUsage = scopes.includes(SIWC_PLAN_SCOPE) && scopes.includes(SIWC_RESOURCE_SCOPE);
+    if (grantedPlanUsage && !accessToken) {
+      throw new SiwcAuthorizationError("SIWC plan-use 权限已授予但没有 access token；未推理。");
+    }
+    const account: SiwcAccountRecord = Object.freeze({
+      clientId: callback.clientId,
+      issuer: SIWC_ISSUER,
+      subject: claims.sub,
+      ...(typeof claims.email === "string" ? { email: claims.email } : {}),
+      ...(typeof claims.name === "string" ? { name: claims.name } : {}),
+      idToken: tokens.id_token,
+      accessToken,
+      refreshToken,
+      scopes,
+      expiresAt: expiresIn === null ? null : Date.now() + expiresIn * 1_000,
+      updatedAt: new Date().toISOString(),
+    });
+    await saveSiwcAccount(storePath, account, existing?.subject);
+    return Object.freeze({ account, planUsageAuthorized: grantedPlanUsage, reusedClientId: Boolean(existing) });
+  } finally {
+    await listener.close();
+  }
+}
+
+export function hasSiwcPlanUsageScope(account: SiwcAccountRecord): boolean {
+  return account.scopes.includes(SIWC_PLAN_SCOPE) && account.scopes.includes(SIWC_RESOURCE_SCOPE);
+}
+
+export function siwcOfflineScopeWasGranted(account: SiwcAccountRecord): boolean {
+  return account.scopes.includes(SIWC_REFRESH_SCOPE);
+}

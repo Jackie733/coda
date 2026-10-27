@@ -10,6 +10,16 @@ M0 从 Git 跟踪的有限路径收集有限文本，并尽力过滤疑似凭据
 
 M1 先要求用户批准具体计划和精确文件范围，再单独批准最终模型请求。它基于固定 `HEAD` 在临时 linked worktree 中只物化已批准文件，生成候选补丁；用户查看完整 diff 后选择保留或丢弃。标准流程不把源工作树的 staged、unstaged 或 untracked 内容作为 M1 上下文，也不提交、推送、开 PR 或合并。Git 会在仓库管理目录登记 linked worktree。当前实现会报告 linked worktree 是否仍存在；但 Git 已移除 worktree 后，父临时目录删除失败可能没有单独报出，详见 [issue #6](https://github.com/Jackie733/coda/issues/6)。
 
+### 可选 SIWC / ChatGPT plan provider（issue #10）
+
+SIWC 是仅供用户在本人本机运行的开源 Coda 使用的可选 provider，不是一般用途的 API 代理，也不允许共享/转让/轮换订阅、为其他人转发请求或汇聚多个账户。该功能没有 Coda paywall；任何付费或远程托管版本必须先满足 OpenAI 的 SIWC 审批要求。授权只能通过 OpenAI 官方 Sign in with ChatGPT 流程取得；禁止索取 ChatGPT 密码/cookie、读取浏览器会话或使用 Codex 私有凭据缓存。
+
+身份登录与计划推理授权分开。只有用户明确运行 `npm run siwc -- login --plan-usage` 并在官方页面同意、且返回的实际授权 scope 包含 `chatgpt.tokens.use.direct` 与 `resource.invoke`，本机才允许发起计划请求；缺失 scope、账户身份不匹配、授权撤回、过期或刷新失败都会显式停止，不会回退到 API-key 计费。每次模型请求仍有独立预览/确认门；API-key 与 SIWC provider 的 endpoint、凭据与计费描述互不混用。
+
+SIWC 凭据只存于用户选择的本机 XDG 配置路径下，Unix 配置目录为 `0700`、凭据文件为 `0600`，通过临时文件原子替换并以本机文件锁串行化写入/刷新。当前版本尚未验证 Windows owner-only ACL，因此在 Windows 上对 SIWC 凭据的读写会 fail closed，不会读取或写入 token。存储包含 issued client ID、subject、ID/access/refresh token 与真实授予的 scopes；CLI/TUI 只显示脱敏状态，不把令牌放入模型 payload、Hono 请求、提示、日志或 diff。按 OpenAI 合约，ID token 仅可作为 `id_token_hint` 送往官方授权 endpoint；access/refresh token 不进入 URL。logout 会按 OIDC discovery 的 revocation endpoint 撤销 refresh token，并无论远端撤销是否可确认都清除本机 token。
+
+计划推理只访问公开的 Responses API 与当前账户的公开模型目录；不调用 ChatGPT 内部 backend endpoint。每个 Responses 请求设置 `store:false`、`stream:true`，只在 `response.completed` 后报告成功；usage-limit、`response.incomplete`、失败事件、断流或非成功 HTTP 状态都不算成功。计划额度可能与其他已连接应用共享，CLI/TUI 显示官方 Usage 管理链接。CI 的 OAuth、token、模型目录和 SSE 全部通过 mock 与 synthetic 数据测试，真实 provider smoke 不自动运行。
+
 ## 需要保护的资产
 
 - 源工作树中的文件、HEAD、index，以及用户的 staged、unstaged、untracked 改动。
