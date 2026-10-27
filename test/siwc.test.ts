@@ -9,6 +9,7 @@ import { runReadonlyCli } from "../src/readonly-cli.js";
 import {
   accountFromStore,
   assertSiwcCredentialPlatform,
+  CredentialDurabilityUncertainError,
   ensureSiwcCredentialStore,
   readSiwcCredentialStore,
   resolveSiwcStorePath,
@@ -225,9 +226,9 @@ test("first plan-use login discloses consumption, sharing, and direct data flow 
       stdout: output,
       fetchImpl: mocks.fetchImpl,
       openBrowser: async (url) => {
-        disclosureWasVisibleBeforeBrowser = /首次授权说明/.test(output.value) &&
+        disclosureWasVisibleBeforeBrowser = /首次启用 ChatGPT plan 的欢迎说明/.test(output.value) &&
           /额度可能与其他已连接应用共享/.test(output.value) &&
-          /题目与所选仓库上下文会直接发送给 OpenAI/.test(output.value) &&
+          /题目与所选仓库上下文仅在后续单独预览并经你批准推理时直接发送给 OpenAI/.test(output.value) &&
           /SIWC 凭据只保存在本机/.test(output.value) &&
           /Coda 不经远端代理/.test(output.value) &&
           output.value.includes(SIWC_USAGE_URL);
@@ -237,10 +238,147 @@ test("first plan-use login discloses consumption, sharing, and direct data flow 
     assert.equal(exitCode, 0);
     assert.equal(disclosureWasVisibleBeforeBrowser, true);
     assert.match(output.value, /会消耗本人 ChatGPT plan\/credits/);
-    assert.match(output.value, /题目与所选仓库上下文会直接发送给 OpenAI/);
+    assert.match(output.value, /题目与所选仓库上下文仅在后续单独预览并经你批准推理时直接发送给 OpenAI/);
     assert.match(output.value, /SIWC 凭据只保存在本机/);
     assert.match(output.value, /Coda 不经远端代理/);
     assert.match(output.value, new RegExp(SIWC_USAGE_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    const savedStore = await readSiwcCredentialStore(_storePath);
+    assert.equal(accountFromStore(savedStore!, ISSUED_CLIENT_ID).planUsageWelcomeSeen, true);
+  });
+});
+
+test("an already-enabled plan account does not repeat the welcome after logout and re-login", async () => {
+  await withTemporaryStore(async (storePath, root) => {
+    await initializedStore(storePath, accountRecord({ planUsageWelcomeSeen: true }));
+    const logout = await logoutSiwcAccount({
+      storePath,
+      clientId: ISSUED_CLIENT_ID,
+      fetchImpl: async () => { throw new Error("synthetic offline revoke"); },
+      delay: async () => undefined,
+    });
+    assert.equal(logout.remoteRevoked, false);
+    const afterLogout = await readSiwcCredentialStore(storePath);
+    const loggedOutAccount = accountFromStore(afterLogout!, ISSUED_CLIENT_ID);
+    assert.equal(loggedOutAccount.planUsageWelcomeSeen, true);
+    assert.deepEqual(loggedOutAccount.scopes, []);
+
+    const mocks = makeAuthorizationMocks();
+    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    let welcomeShownBeforeBrowser = false;
+    const exitCode = await runSiwcCli({
+      argv: ["login", "--plan-usage"],
+      env: { XDG_CONFIG_HOME: path.join(root, "config") },
+      stdout: output,
+      fetchImpl: mocks.fetchImpl,
+      openBrowser: async (url) => {
+        welcomeShownBeforeBrowser = /首次启用 ChatGPT plan 的欢迎说明/.test(output.value);
+        await mocks.openBrowser(url);
+      },
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(welcomeShownBeforeBrowser, false);
+    assert.match(output.value, /此前已启用 ChatGPT plan usage 账户的重新登录/);
+    assert.doesNotMatch(output.value, /首次启用 ChatGPT plan 的欢迎说明/);
+    const afterLogin = await readSiwcCredentialStore(storePath);
+    assert.equal(accountFromStore(afterLogin!, ISSUED_CLIENT_ID).planUsageWelcomeSeen, true);
+  });
+});
+
+test("legacy account records infer first plan welcome from scopes without a persisted marker", async () => {
+  const legacyCases = [
+    { name: "previously plan-authorized legacy record", account: accountRecord(), expectedWelcome: false },
+    { name: "identity-only legacy record", account: accountRecord({ scopes: Object.freeze([...SIWC_IDENTITY_SCOPES]) }), expectedWelcome: true },
+  ] as const;
+  for (const item of legacyCases) {
+    await withTemporaryStore(async (storePath, root) => {
+      await initializedStore(storePath, item.account);
+      const legacyJson = await readFile(storePath, "utf8");
+      assert.doesNotMatch(legacyJson, /planUsageWelcomeSeen/);
+      const legacyStore = await readSiwcCredentialStore(storePath);
+      assert.equal(accountFromStore(legacyStore!, ISSUED_CLIENT_ID).planUsageWelcomeSeen, undefined);
+
+      const mocks = makeAuthorizationMocks();
+      const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+      let welcomeShownBeforeBrowser = false;
+      const exitCode = await runSiwcCli({
+        argv: ["login", "--client-id", ISSUED_CLIENT_ID, "--plan-usage"],
+        env: { XDG_CONFIG_HOME: path.join(root, "config") },
+        stdout: output,
+        fetchImpl: mocks.fetchImpl,
+        openBrowser: async (url) => {
+          welcomeShownBeforeBrowser = /首次启用 ChatGPT plan 的欢迎说明/.test(output.value);
+          await mocks.openBrowser(url);
+        },
+      });
+      assert.equal(exitCode, 0, item.name);
+      assert.equal(welcomeShownBeforeBrowser, item.expectedWelcome, item.name);
+      if (item.expectedWelcome) assert.match(output.value, /首次启用 ChatGPT plan 的欢迎说明/);
+      else assert.match(output.value, /此前已启用 ChatGPT plan usage 账户的重新登录/);
+      const updated = await readSiwcCredentialStore(storePath);
+      assert.equal(accountFromStore(updated!, ISSUED_CLIENT_ID).planUsageWelcomeSeen, true);
+    });
+  }
+});
+
+test("default login refuses to guess when multiple accounts exist without an active selection", async () => {
+  await withTemporaryStore(async (storePath, root) => {
+    await initializedStore(storePath, accountRecord());
+    await saveSiwcAccount(storePath, accountRecord({
+      clientId: "oaiapp_synthetic_second_client",
+      subject: "synthetic-second-subject",
+      email: "second@example.invalid",
+      idToken: "synthetic-second-id-token-never-log",
+      accessToken: "synthetic-second-access-token-never-log",
+      refreshToken: "synthetic-second-refresh-token-never-log",
+    }));
+    await logoutSiwcAccount({
+      storePath,
+      clientId: "oaiapp_synthetic_second_client",
+      fetchImpl: async () => { throw new Error("synthetic offline revoke"); },
+      delay: async () => undefined,
+    });
+
+    let networkCalls = 0;
+    let browserOpened = false;
+    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    const exitCode = await runSiwcCli({
+      argv: ["login", "--plan-usage"],
+      env: { XDG_CONFIG_HOME: path.join(root, "config") },
+      stdout: output,
+      fetchImpl: async () => { networkCalls += 1; throw new Error("OAuth must not start"); },
+      openBrowser: async () => { browserOpened = true; },
+    });
+    assert.equal(exitCode, 1);
+    assert.match(output.value, /多个 SIWC 账户且当前未选择账户/);
+    assert.match(output.value, /--client-id <issued-client-id>/);
+    assert.equal(networkCalls, 0);
+    assert.equal(browserOpened, false);
+  });
+});
+
+test("identity-only login discloses OAuth data handling before opening authorization", async () => {
+  await withTemporaryStore(async (_storePath, root) => {
+    const mocks = makeAuthorizationMocks({ scopes: SIWC_IDENTITY_SCOPES });
+    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    let noticeShownBeforeBrowser = false;
+    const exitCode = await runSiwcCli({
+      argv: ["login"],
+      env: { XDG_CONFIG_HOME: path.join(root, "config") },
+      stdout: output,
+      fetchImpl: mocks.fetchImpl,
+      openBrowser: async (url) => {
+        noticeShownBeforeBrowser = /账户标识/.test(output.value) && /email\/name/.test(output.value) &&
+          /授权 scopes 与令牌/.test(output.value) && /只在本机保存 SIWC 凭据/.test(output.value) &&
+          /Coda 不接收或远端代理/.test(output.value) && /本次身份登录不会发送任务或仓库文本/.test(output.value) &&
+          /之后单独预览并由你批准/.test(output.value);
+        await mocks.openBrowser(url);
+      },
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(noticeShownBeforeBrowser, true);
+    assert.match(output.value, /不会启用 ChatGPT plan 推理/);
+    assert.match(output.value, /任务或仓库文本/);
+    assert.doesNotMatch(output.value, /首次启用 ChatGPT plan 的欢迎说明/);
   });
 });
 
@@ -473,9 +611,97 @@ test("temporary-file close failure removes secret temp file and preserves origin
   });
 });
 
+test("temporary-file fsync and rename failures keep the original credential file and remove temp files", async () => {
+  await withTemporaryStore(async (storePath) => {
+    await initializedStore(storePath, accountRecord({ accessToken: "synthetic-original-write-token" }));
+    for (const failure of ["temporary-fsync", "rename"] as const) {
+      const originalContents = await readFile(storePath, "utf8");
+      const originalStore = await readSiwcCredentialStore(storePath);
+      assert.ok(originalStore);
+      const attemptedSecret = `synthetic-${failure}-token-never-log`;
+      const attemptedStore = Object.freeze({
+        ...originalStore,
+        accounts: Object.freeze(originalStore.accounts.map((account) => Object.freeze({
+          ...account,
+          accessToken: attemptedSecret,
+          refreshToken: attemptedSecret,
+        }))),
+      });
+      const options = failure === "temporary-fsync"
+        ? {
+            openTemporaryFile: async (temporaryPath: string) => {
+              const handle = await open(temporaryPath, "wx", 0o600);
+              return {
+                writeFile: async (data: string, encoding: "utf8") => { await handle.writeFile(data, encoding); },
+                sync: async () => { throw new Error(`synthetic private fsync failure ${attemptedSecret}`); },
+                chmod: (mode: number) => handle.chmod(mode),
+                truncate: (length?: number) => handle.truncate(length),
+                close: () => handle.close(),
+              };
+            },
+          }
+        : {
+            replaceFile: async (sourcePath: string, targetPath: string) => {
+              assert.equal(await readFile(targetPath, "utf8"), originalContents);
+              assert.ok((await readFile(sourcePath, "utf8")).includes(attemptedSecret));
+              throw new Error(`synthetic private rename failure ${attemptedSecret}`);
+            },
+          };
+      await assert.rejects(writeSiwcCredentialStoreAtomically(storePath, attemptedStore, options), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /原凭据未替换/);
+        assert.doesNotMatch(error.message, /synthetic private .*failure/);
+        assert.doesNotMatch(error.stack ?? "", /synthetic private .*failure/);
+        return true;
+      });
+      assert.equal(await readFile(storePath, "utf8"), originalContents);
+      assert.deepEqual((await readdir(path.dirname(storePath))).filter((name) => name.endsWith(".tmp")), []);
+      const actualStore = await readSiwcCredentialStore(storePath);
+      assert.equal(actualStore?.accounts[0]?.accessToken, "synthetic-original-write-token");
+      assert.ok(!originalContents.includes(attemptedSecret));
+    }
+  });
+});
+
+test("directory fsync failure reports durability uncertainty after the new store is committed", async () => {
+  await withTemporaryStore(async (storePath) => {
+    await initializedStore(storePath, accountRecord({ accessToken: "synthetic-old-durable-token" }));
+    const originalContents = await readFile(storePath, "utf8");
+    const originalStore = await readSiwcCredentialStore(storePath);
+    assert.ok(originalStore);
+    const newToken = "synthetic-new-rotated-token-never-log";
+    const nextStore = Object.freeze({
+      ...originalStore,
+      accounts: Object.freeze(originalStore.accounts.map((account) => Object.freeze({
+        ...account,
+        accessToken: newToken,
+        refreshToken: "synthetic-new-refresh-token-never-log",
+      }))),
+    });
+    await assert.rejects(writeSiwcCredentialStoreAtomically(storePath, nextStore, {
+      syncDirectory: async () => { throw new Error(`synthetic private directory fsync failure ${newToken}`); },
+    }), (error: unknown) => {
+      assert.ok(error instanceof CredentialDurabilityUncertainError);
+      assert.match(error.message, /已原子替换到目标路径/);
+      assert.match(error.message, /目录同步失败，崩溃持久性未确认/);
+      assert.match(error.message, /siwc -- status/);
+      assert.doesNotMatch(error.message, /synthetic-new-rotated-token-never-log/);
+      assert.doesNotMatch(error.stack ?? "", /synthetic-new-rotated-token-never-log/);
+      return true;
+    });
+    const actualContents = await readFile(storePath, "utf8");
+    assert.notEqual(actualContents, originalContents);
+    assert.ok(actualContents.includes(newToken));
+    assert.deepEqual((await readdir(path.dirname(storePath))).filter((name) => name.endsWith(".tmp")), []);
+    const actualStore = await readSiwcCredentialStore(storePath);
+    assert.equal(actualStore?.accounts[0]?.accessToken, newToken);
+    assert.equal(actualStore?.accounts[0]?.refreshToken, "synthetic-new-refresh-token-never-log");
+  });
+});
+
 test("refresh token rotation is serialized across concurrent callers and replaces the whole token set", async () => {
   await withTemporaryStore(async (storePath) => {
-    await initializedStore(storePath, accountRecord({ expiresAt: Date.now() - 10_000 }));
+    await initializedStore(storePath, accountRecord({ expiresAt: Date.now() - 10_000, planUsageWelcomeSeen: true }));
     let refreshCalls = 0;
     const fetchImpl: typeof fetch = async (input, init) => {
       assert.equal(String(input), SIWC_TOKEN_ENDPOINT);
@@ -506,6 +732,7 @@ test("refresh token rotation is serialized across concurrent callers and replace
     const account = accountFromStore(stored!, ISSUED_CLIENT_ID);
     assert.equal(account.accessToken, "synthetic-rotated-access-token");
     assert.equal(account.refreshToken, "synthetic-rotated-refresh-token");
+    assert.equal(account.planUsageWelcomeSeen, true);
     assert.ok((account.expiresAt ?? 0) > Date.now());
     const text = await readFile(storePath, "utf8");
     assert.ok(!text.includes(CALLBACK_REFRESH_TOKEN));
@@ -682,6 +909,104 @@ test("token-bearing token retrieval errors are sanitized before provider errors 
   assert.equal(networkCalls, 0);
 });
 
+test("provider and CLI safely stop after credential durability becomes uncertain", async () => {
+  const syntheticSecret = "synthetic-directory-sync-underlying-token-never-log";
+  let modelNetworkCalls = 0;
+  const provider = createSiwcResponsesProvider({
+    getAccessToken: async () => {
+      const error = new CredentialDurabilityUncertainError();
+      Object.defineProperty(error, "cause", { value: new Error(syntheticSecret) });
+      throw error;
+    },
+    fetchImpl: async () => { modelNetworkCalls += 1; throw new Error("must not reach model endpoint"); },
+  });
+  await assert.rejects(provider.send(responsesRequest()), (error: unknown) => {
+    assert.ok(error instanceof SiwcProviderError);
+    assert.match(error.message, /新内容已原子替换到目标路径/);
+    assert.match(error.message, /目录同步失败、崩溃持久性未确认/);
+    assert.match(error.message, /本次未发起推理/);
+    assert.match(error.message, /siwc -- status/);
+    assert.doesNotMatch(error.message, /synthetic-directory-sync-underlying-token-never-log/);
+    assert.doesNotMatch(error.stack ?? "", /synthetic-directory-sync-underlying-token-never-log/);
+    return true;
+  });
+
+  const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+  const exitCode = await runReadonlyCli({
+    cwd: "/synthetic/repository",
+    requestMode: "siwc",
+    model: "synthetic-current-slug",
+    env: {},
+    inspect: async () => syntheticSnapshot,
+    stdout: output,
+    confirmSend: async () => true,
+    provider,
+  });
+  assert.equal(exitCode, 1);
+  assert.match(output.value, /目录同步失败、崩溃持久性未确认/);
+  assert.match(output.value, /siwc -- status/);
+  assert.doesNotMatch(output.value, /synthetic-directory-sync-underlying-token-never-log/);
+  assert.equal(modelNetworkCalls, 0);
+});
+
+test("rotated refresh credentials with directory durability uncertainty stop the CLI before inference", async () => {
+  await withTemporaryStore(async (storePath) => {
+    await initializedStore(storePath, accountRecord({
+      accessToken: "synthetic-expired-access-token",
+      refreshToken: "synthetic-old-refresh-token",
+      expiresAt: Date.now() - 10_000,
+    }));
+    const rotatedAccessToken = "synthetic-rotated-access-token-never-log";
+    const rotatedRefreshToken = "synthetic-rotated-refresh-token-never-log";
+    let refreshCalls = 0;
+    let modelCalls = 0;
+    const provider = createSiwcResponsesProvider({
+      getAccessToken: () => getSiwcAccessTokenForUsage({
+        storePath,
+        fetchImpl: async (input) => {
+          assert.equal(String(input), SIWC_TOKEN_ENDPOINT);
+          refreshCalls += 1;
+          return Response.json({
+            access_token: rotatedAccessToken,
+            refresh_token: rotatedRefreshToken,
+            token_type: "Bearer",
+            expires_in: 3600,
+            scope: FULL_SCOPES.join(" "),
+          });
+        },
+        credentialWriteOptions: {
+          syncDirectory: async () => { throw new Error(`synthetic directory fsync detail ${rotatedAccessToken}`); },
+        },
+      }),
+      fetchImpl: async () => { modelCalls += 1; throw new Error("model inference must not start"); },
+    });
+    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    const exitCode = await runReadonlyCli({
+      cwd: "/synthetic/repository",
+      requestMode: "siwc",
+      model: "synthetic-current-slug",
+      env: {},
+      inspect: async () => syntheticSnapshot,
+      stdout: output,
+      confirmSend: async () => true,
+      provider,
+    });
+    assert.equal(exitCode, 1);
+    assert.equal(refreshCalls, 1);
+    assert.equal(modelCalls, 0);
+    assert.match(output.value, /新内容已原子替换到目标路径/);
+    assert.match(output.value, /目录同步失败、崩溃持久性未确认/);
+    assert.match(output.value, /本次未发起推理/);
+    assert.match(output.value, /siwc -- status/);
+    assert.doesNotMatch(output.value, /synthetic directory fsync detail|synthetic-rotated-access-token-never-log/);
+    assert.deepEqual((await readdir(path.dirname(storePath))).filter((name) => name.endsWith(".tmp")), []);
+    const actualStore = await readSiwcCredentialStore(storePath);
+    const actualAccount = accountFromStore(actualStore!, ISSUED_CLIENT_ID);
+    assert.equal(actualAccount.accessToken, rotatedAccessToken);
+    assert.equal(actualAccount.refreshToken, rotatedRefreshToken);
+  });
+});
+
 test("SSE parser handles complete and one-byte CRLF/CR/LF streams and only completes on response.completed", async () => {
   const sample = 'event: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"ok"}\r\n\r\nevent: response.completed\r\ndata: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}}\r\n\r\n';
   const encoder = new TextEncoder();
@@ -726,17 +1051,17 @@ test("Responses API errors preserve safe error.code and error.param with actiona
   const provider = createSiwcResponsesProvider({
     getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
     fetchImpl: async () => Response.json({
-      error: { code: "unsupported_capability", param: "tools", message: "synthetic raw provider detail" },
+      error: { code: "subscription_sharing_unsupported_capability", param: "tools", message: "synthetic raw provider detail" },
     }, { status: 400 }),
   });
   await assert.rejects(provider.send(responsesRequest()), (error: unknown) => {
     assert.ok(error instanceof SiwcProviderError);
-    assert.equal(error.code, "unsupported_capability");
+    assert.equal(error.code, "subscription_sharing_unsupported_capability");
     assert.equal(error.param, "tools");
     const userMessage = error.toUserMessage();
-    assert.match(userMessage, /unsupported Responses field or capability/i);
+    assert.match(userMessage, /unsupported SIWC capability/i);
     assert.match(userMessage, /tools/);
-    assert.match(userMessage, /error.code=unsupported_capability/);
+    assert.match(userMessage, /error.code=subscription_sharing_unsupported_capability/);
     assert.match(userMessage, /error.param=tools/);
     assert.doesNotMatch(userMessage, /synthetic raw provider detail/);
     return true;
@@ -753,10 +1078,53 @@ test("Responses API errors preserve safe error.code and error.param with actiona
     provider,
   });
   assert.equal(exitCode, 1);
-  assert.match(output.value, /unsupported Responses field or capability/);
-  assert.match(output.value, /error.code=unsupported_capability/);
+  assert.match(output.value, /unsupported SIWC capability/);
+  assert.match(output.value, /error.code=subscription_sharing_unsupported_capability/);
   assert.match(output.value, /error.param=tools/);
   assert.doesNotMatch(output.value, /synthetic raw provider detail/);
+});
+
+test("all official SIWC Responses error codes retain code/param and actionable recovery guidance", async () => {
+  const cases = [
+    { code: "subscription_sharing_unsupported_capability", status: 400, param: "tools.execution", expected: /error.param=tools\.execution.*remove or revise.*Do not resend the same body/i },
+    { code: "subscription_sharing_route_not_supported", status: 403, expected: /verify the method and URL.*POST https:\/\/api\.openai\.com\/v1\/responses/i },
+    { code: "subscription_sharing_invalid_user", status: 401, expected: /preserve the request ID.*only after confirmed revocation or a terminal refresh failure/i },
+    { code: "chatpass_v2_scope_not_authorized", status: 403, expected: /check the issued client and grant configuration.*Do not blindly retry or change billing mode/i },
+    { code: "chatpass_v2_invalid_authorization_context", status: 403, expected: /check the issued client and grant configuration.*Do not blindly retry or change billing mode/i },
+    { code: "subscription_sharing_user_not_eligible", status: 403, expected: /selected user, workspace, or policy.*do not repeat this request or loop through OAuth/i },
+    { code: "subscription_sharing_usage_limit_exceeded", status: 429, expected: /cannot distinguish an app-specific limit from a shared plan limit.*does not indicate a reset time/i },
+    { code: "subscription_sharing_usage_unavailable", status: 503, expected: /preserve credentials and retry later with bounded backoff/i },
+    { code: "subscription_sharing_user_unavailable", status: 503, expected: /preserve credentials and retry later with bounded backoff/i },
+  ] as const;
+  for (const item of cases) {
+    const requestId = `synthetic-${item.code}`;
+    const privateMessage = `synthetic private response text ${item.code}`;
+    const provider = createSiwcResponsesProvider({
+      getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+      fetchImpl: async () => Response.json({
+        error: { code: item.code, ...(item.param ? { param: item.param } : {}), message: privateMessage },
+      }, { status: item.status, headers: { "openai-request-id": requestId } }),
+    });
+    await assert.rejects(provider.send(responsesRequest()), (error: unknown) => {
+      assert.ok(error instanceof SiwcProviderError);
+      assert.equal(error.status, item.status);
+      assert.equal(error.code, item.code);
+      assert.equal(error.param, item.param ?? null);
+      assert.equal(error.bodyShape, "error-object");
+      assert.equal(error.requestId, requestId);
+      const message = error.toUserMessage();
+      assert.match(message, item.expected);
+      assert.match(message, new RegExp(`error.code=${item.code}`));
+      assert.match(message, new RegExp(`request ID=${requestId}`));
+      if (item.param) assert.match(message, new RegExp(`error.param=${item.param}`));
+      assert.doesNotMatch(message, /synthetic private response text/);
+      if (item.code === "subscription_sharing_usage_limit_exceeded") {
+        assert.match(message, new RegExp(SIWC_USAGE_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        assert.doesNotMatch(message, /entire plan.*exhausted|reset in \d+/i);
+      }
+      return true;
+    });
+  }
 });
 
 test("Responses provider refuses system-role input and preview-only unsupported fields before token access", async () => {
@@ -790,14 +1158,17 @@ test("usage-limit stream errors never become success and point to shared plan us
     assert.equal(error.code, "subscription_sharing_usage_limit_exceeded");
     assert.equal(error.status, 200);
     assert.equal(error.requestId, "synthetic-stream-id");
-    assert.match(error.message, /usage limit reached/i);
+    assert.match(error.message, /usage limit was reached/i);
+    assert.match(error.message, /cannot distinguish an app-specific limit from a shared plan limit/i);
+    assert.match(error.message, /does not indicate a reset time/i);
+    assert.doesNotMatch(error.message, /entire plan.*exhausted|reset in \d+/i);
     assert.match(error.message, new RegExp(SIWC_USAGE_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.doesNotMatch(error.message, /synthetic only|partial synthetic text/);
     return true;
   });
 });
 
-test("a stream without response.completed and a non-OK detail body remain explicit failures", async () => {
+test("a stream without response.completed fails and direct-admission detail bodies preserve safe diagnostics only", async () => {
   const interrupted = createSiwcResponsesProvider({
     getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
     fetchImpl: async () => new Response(sseEvent("response.output_text.delta", { delta: "partial" }), {
@@ -807,19 +1178,45 @@ test("a stream without response.completed and a non-OK detail body remain explic
   });
   await assert.rejects(interrupted.send(responsesRequest()), /without response.completed/);
 
-  const rejected = createSiwcResponsesProvider({
-    getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
-    fetchImpl: async () => Response.json({ detail: "synthetic private diagnostic" }, { status: 503, headers: { "openai-request-id": "synthetic-admission-id" } }),
-  });
-  await assert.rejects(rejected.send(responsesRequest()), (error: unknown) => {
-    assert.ok(error instanceof SiwcProviderError);
-    assert.equal(error.status, 503);
-    assert.equal(error.code, null);
-    assert.equal(error.bodyShape, "detail-object");
-    assert.equal(error.requestId, "synthetic-admission-id");
-    assert.doesNotMatch(error.message, /synthetic private diagnostic/);
-    return true;
-  });
+  const admissionCases = [
+    { status: 401, requestId: "synthetic-admission-401", code: "admission_denied", param: "scopes" },
+    { status: 403, requestId: "synthetic-admission-403", unsafeParam: "bad\nsynthetic-injected-param-secret" },
+    { status: 503, requestId: "synthetic-admission-503", code: "route_temporarily_unavailable" },
+    { status: 403, requestId: "synthetic-admission-nested-detail", code: "chatpass_v2_scope_not_authorized", param: "resource.invoke", nestedDetail: true },
+  ] as const;
+  for (const item of admissionCases) {
+    const secretDetail = `synthetic private diagnostic ${item.status}`;
+    const providedParam = item.param ?? ("unsafeParam" in item ? item.unsafeParam : undefined);
+    const nestedDetail = "nestedDetail" in item && item.nestedDetail;
+    const detail = nestedDetail
+      ? { ...(item.code ? { code: item.code } : {}), ...(providedParam ? { param: providedParam } : {}), message: secretDetail }
+      : secretDetail;
+    const provider = createSiwcResponsesProvider({
+      getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+      fetchImpl: async () => Response.json({
+        detail,
+        ...(!nestedDetail && item.code ? { code: item.code } : {}),
+        ...(!nestedDetail && providedParam ? { param: providedParam } : {}),
+      }, { status: item.status, headers: { "openai-request-id": item.requestId } }),
+    });
+    await assert.rejects(provider.send(responsesRequest()), (error: unknown) => {
+      assert.ok(error instanceof SiwcProviderError);
+      assert.equal(error.status, item.status);
+      assert.equal(error.code, item.code ?? null);
+      assert.equal(error.param, item.param ?? null);
+      assert.equal(error.bodyShape, "detail-object");
+      assert.equal(error.requestId, item.requestId);
+      const message = error.toUserMessage();
+      assert.match(message, new RegExp(`HTTP ${item.status}`));
+      assert.match(message, /response body shape=detail-object/);
+      assert.match(message, new RegExp(`request ID=${item.requestId}`));
+      if (item.code) assert.match(message, new RegExp(`error.code=${item.code}`));
+      if (item.param) assert.match(message, new RegExp(`error.param=${item.param}`));
+      if (nestedDetail) assert.match(message, /check the issued client and grant configuration/i);
+      assert.doesNotMatch(message, /synthetic private diagnostic|synthetic-injected-param-secret/);
+      return true;
+    });
+  }
 });
 
 test("readonly CLI previews SIWC JSON without API key, sends only after approval, and never falls back", async () => {

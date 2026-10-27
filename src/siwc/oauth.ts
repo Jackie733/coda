@@ -420,6 +420,9 @@ export async function runSiwcAuthorization(options: AuthorizationOptions): Promi
       fetchImpl,
     });
     const grantedPlanUsage = scopes.includes(SIWC_PLAN_SCOPE) && scopes.includes(SIWC_RESOURCE_SCOPE);
+    const planUsageWelcomeSeen = grantedPlanUsage || Boolean(existing?.planUsageWelcomeSeen) || Boolean(
+      existing?.scopes.includes(SIWC_PLAN_SCOPE) && existing.scopes.includes(SIWC_RESOURCE_SCOPE),
+    );
     if (grantedPlanUsage && !accessToken) {
       throw new SiwcAuthorizationError("SIWC plan-use 权限已授予但没有 access token；未推理。");
     }
@@ -429,6 +432,7 @@ export async function runSiwcAuthorization(options: AuthorizationOptions): Promi
       subject: claims.sub,
       ...(typeof claims.email === "string" ? { email: claims.email } : {}),
       ...(typeof claims.name === "string" ? { name: claims.name } : {}),
+      planUsageWelcomeSeen,
       idToken: tokens.id_token,
       accessToken,
       refreshToken,

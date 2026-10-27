@@ -14,6 +14,7 @@ export type SiwcAccountRecord = Readonly<{
   subject: string;
   email?: string;
   name?: string;
+  planUsageWelcomeSeen?: boolean;
   idToken: string | null;
   accessToken: string | null;
   refreshToken: string | null;
@@ -59,7 +60,18 @@ export type SiwcTemporaryFileHandle = Readonly<{
 export type SiwcCredentialWriteOptions = Readonly<{
   /** Internal fault-injection seam; production callers should omit this option. */
   openTemporaryFile?: (filePath: string) => Promise<SiwcTemporaryFileHandle>;
+  /** Internal fault-injection seam; must match fs.rename semantics: reject only before commit and never throw after a successful rename. */
+  replaceFile?: (sourcePath: string, targetPath: string) => Promise<void>;
+  /** Internal fault-injection seam; production callers should omit this option. */
+  syncDirectory?: (directoryPath: string) => Promise<void>;
 }>;
+
+export class CredentialDurabilityUncertainError extends Error {
+  constructor() {
+    super("SIWC 凭据文件内容已原子替换到目标路径，但目录同步失败，崩溃持久性未确认；请重新运行 `npm run siwc -- status` 检查本机账户状态。");
+    this.name = "CredentialDurabilityUncertainError";
+  }
+}
 
 export function resolveSiwcStorePath(env: Environment = process.env): string {
   const configuredHome = env.XDG_CONFIG_HOME;
@@ -96,12 +108,14 @@ function validateAccount(value: unknown): SiwcAccountRecord {
   }
   if (value.email !== undefined && typeof value.email !== "string") throw new Error("SIWC 本地账户信息格式无效。");
   if (value.name !== undefined && typeof value.name !== "string") throw new Error("SIWC 本地账户信息格式无效。");
+  if (value.planUsageWelcomeSeen !== undefined && typeof value.planUsageWelcomeSeen !== "boolean") throw new Error("SIWC 本地欢迎状态格式无效。");
   return Object.freeze({
     clientId,
     issuer,
     subject,
     ...(typeof value.email === "string" ? { email: value.email } : {}),
     ...(typeof value.name === "string" ? { name: value.name } : {}),
+    ...(typeof value.planUsageWelcomeSeen === "boolean" ? { planUsageWelcomeSeen: value.planUsageWelcomeSeen } : {}),
     idToken,
     accessToken,
     refreshToken,
@@ -197,6 +211,11 @@ async function writeAtomicFile(
   storePath: string,
   store: SiwcCredentialStore,
   openTemporaryFile: (filePath: string) => Promise<SiwcTemporaryFileHandle> = (filePath) => open(filePath, "wx", FILE_MODE),
+  replaceFile: (sourcePath: string, targetPath: string) => Promise<void> = (sourcePath, targetPath) => rename(sourcePath, targetPath),
+  syncDirectory: (directoryPath: string) => Promise<void> = async (directoryPath) => {
+    const directoryHandle = await open(directoryPath, "r");
+    try { await directoryHandle.sync(); } finally { await directoryHandle.close().catch(() => undefined); }
+  },
 ): Promise<void> {
   await ensurePrivateDirectory(storePath);
   const checked = validateStore(store);
@@ -234,15 +253,22 @@ async function writeAtomicFile(
       : "SIWC 凭据原子写入失败；原凭据未替换，但临时文件清理未能确认，请检查本机凭据目录。");
   }
 
+  // The replacement operation follows fs.rename commit semantics: rejection means the target was not replaced.
   try {
-    await rename(temporaryPath, storePath);
-    if (process.platform !== "win32") {
-      const directoryHandle = await open(path.dirname(storePath), "r");
-      try { await directoryHandle.sync(); } finally { await directoryHandle.close().catch(() => undefined); }
-    }
+    await replaceFile(temporaryPath, storePath);
   } catch {
-    await rm(temporaryPath, { force: true }).catch(() => undefined);
-    throw new Error("SIWC 凭据原子替换或目录同步失败；请重新检查本机凭据状态。");
+    let cleaned = true;
+    try { await rm(temporaryPath, { force: true }); } catch { cleaned = false; }
+    throw new Error(cleaned
+      ? "SIWC 凭据原子替换失败；原凭据未替换，临时文件已清理。"
+      : "SIWC 凭据原子替换失败；原凭据未替换，但临时文件清理未能确认，请检查本机凭据目录。");
+  }
+  if (process.platform !== "win32") {
+    try {
+      await syncDirectory(path.dirname(storePath));
+    } catch {
+      throw new CredentialDurabilityUncertainError();
+    }
   }
 }
 
@@ -256,7 +282,13 @@ export async function writeSiwcCredentialStoreAtomically(
   store: SiwcCredentialStore,
   options: SiwcCredentialWriteOptions = {},
 ): Promise<void> {
-  return withSiwcStoreLock(storePath, () => writeAtomicFile(storePath, store, options.openTemporaryFile));
+  return withSiwcStoreLock(storePath, () => writeAtomicFile(
+    storePath,
+    store,
+    options.openTemporaryFile,
+    options.replaceFile,
+    options.syncDirectory,
+  ));
 }
 
 export async function withSiwcStoreLock<T>(storePath: string, operation: () => Promise<T>): Promise<T> {
@@ -380,13 +412,14 @@ export function clearSiwcAccountTokens(
 export async function mutateSiwcCredentialStoreLocked<T>(
   storePath: string,
   operation: (current: SiwcCredentialStore) => Promise<Readonly<{ store: SiwcCredentialStore; result: T }>>,
+  writeOptions: SiwcCredentialWriteOptions = {},
 ): Promise<T> {
   return withSiwcStoreLock(storePath, async () => {
     const current = await readUnlocked(storePath);
     if (!current) throw new Error("SIWC 本地凭据尚未初始化；请先运行登录流程。");
     const changed = await operation(current);
     const updated = validateStore(changed.store);
-    await writeUnlocked(storePath, updated);
+    await writeAtomicFile(storePath, updated, writeOptions.openTemporaryFile, writeOptions.replaceFile, writeOptions.syncDirectory);
     return changed.result;
   });
 }

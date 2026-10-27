@@ -9,6 +9,7 @@ import {
   SIWC_RESOURCE_SCOPE,
   type SiwcAccountRecord,
   type SiwcCredentialStore,
+  type SiwcCredentialWriteOptions,
 } from "./credential-store.js";
 import { readSiwcOidcConfiguration, SIWC_RESOURCE, verifySiwcIdToken } from "./oauth.js";
 
@@ -78,6 +79,8 @@ export async function getSiwcAccessTokenForUsage(input: Readonly<{
   storePath?: string;
   clientId?: string;
   fetchImpl?: typeof fetch;
+  /** Internal fault-injection seam; production callers should omit this option. */
+  credentialWriteOptions?: SiwcCredentialWriteOptions;
 }> = {}): Promise<string> {
   const storePath = input.storePath ?? resolveSiwcStorePath();
   const fetchImpl = input.fetchImpl ?? fetch;
@@ -178,7 +181,7 @@ export async function getSiwcAccessTokenForUsage(input: Readonly<{
       return { store: nextStore, result: Object.freeze({ accessToken: null, failure: "SIWC refresh 后未保留 plan-use 授权 scope；未发起推理。请重新确认账户授权。" }) };
     }
     return { store: nextStore, result: Object.freeze({ accessToken: nextAccount.accessToken, failure: null as string | null }) };
-  });
+  }, input.credentialWriteOptions);
   if (!result.accessToken) throw new Error(result.failure ?? "SIWC access token 不可用；未发起推理。");
   return result.accessToken;
 }

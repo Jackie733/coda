@@ -94,11 +94,11 @@ npm run siwc -- inspect --model <从 models 返回的 slug> "请说明入口与�
 npm run siwc -- logout
 ```
 
-只有 `login --plan-usage` 才请求 `chatgpt.tokens.use.direct`（以及官方流程所需的资源/刷新 scopes）；身份登录或缺少实际授予的 plan-use scope 都不能发起计划推理。首次动态注册后，必须用授权回调签发的 client ID；多账户可用 `status` 查看并用 `select <issued-client-id>` 切换。模型列表来自所选账户当前可见的官方 `/v1/models` 目录，交互终端可选择，非交互终端须显式传 `--model`。
+只有 `login --plan-usage` 才请求 `chatgpt.tokens.use.direct`（以及官方流程所需的资源/刷新 scopes）；身份登录或缺少实际授予的 plan-use scope 都不能发起计划推理。首次动态注册后，必须用授权回调签发的 client ID；多账户可用 `status` 查看并用 `select <issued-client-id>` 切换。注销后若本机仅有一个已保存账户，默认 `login` 会复用它；多账户且没有活动选择时，必须显式给出 `--client-id <issued-client-id>`，不会猜选账户。模型列表来自所选账户当前可见的官方 `/v1/models` 目录，交互终端可选择，非交互终端须显式传 `--model`。
 
 `inspect` 会先按现有只读流程收集有限的已跟踪源码，展示最终 Responses JSON 和模型，然后要求逐次确认。隐私告知：这个 payload 包含你输入的任务/问题和所选仓库的有限已跟踪文本上下文；批准后由本机直接发送给 OpenAI 官方 Responses API，Coda 不接收或远端代理该请求。SIWC 凭据只保存在本机；access token 不放进 payload，只在批准后由本机放入直连 OpenAI 的 Authorization header。请求设为 `store:false`、`stream:true`，只有收到 `response.completed` 才算成功；不使用 ChatGPT 内部 backend API。SIWC 请求从不读取 API key、不走 Hono `/agent`，失败也不会切换 API-key provider。OpenAI API key 与 ChatGPT plan/credits 是两种独立计费方式。
 
-每次请求预览都会显示“正在使用 ChatGPT 方案额度”、额度会被本次请求消耗且可能与其他已连接应用共享，并附 [Usage 管理入口](https://chatgpt.com/settings/usage)；首次 `login --plan-usage` 也会在打开授权页前说明额度消耗、共享和数据直发。遇到额度上限时会停止该次 plan 请求并给出管理入口，不会静默改用 API key。`status` 不展示 token；Unix 配置目录权限为 `0700`、凭据文件权限为 `0600`，支持 refresh-token 轮换与 logout 撤销。由于当前版本未验证 Windows owner-only ACL，SIWC 凭据读取/写入在 Windows 上会 fail closed（其他本机 CLI/TUI 功能不受影响）。CI 只使用 mock OAuth/token/model endpoints 和 synthetic repository/prompt；不会自动运行真实账户或模型 smoke。
+每次请求预览都会显示“正在使用 ChatGPT 方案额度”、额度会被本次请求消耗且可能与其他已连接应用共享，并附 [Usage 管理入口](https://chatgpt.com/settings/usage)。首次为新账户或尚未获 plan-use scope 的账户运行 `login --plan-usage` 时显示欢迎说明；成功授权后，本机账户记录会保留该状态，注销后重登也不重复。身份-only `login` 会在打开授权页前说明 OAuth 返回的账户标识、可能的 email/name、scopes 与 token 如何在本机处理，且该步骤不发送任务/仓库文本；这些上下文只在后续单独预览并批准的推理请求中直发 OpenAI。遇到 usage-limit 时会停止 plan 请求并给出 Usage 入口；错误码不能区分 app 专属限制与共享 plan 限制，也不能推断重置时间，不会静默改用 API key。`status` 不展示 token；Unix 配置目录权限为 `0700`、凭据文件权限为 `0600`，支持 refresh-token 轮换与 logout 撤销。由于当前版本未验证 Windows owner-only ACL，SIWC 凭据读取/写入在 Windows 上会 fail closed（其他本机 CLI/TUI 功能不受影响）。CI 只使用 mock OAuth/token/model endpoints 和 synthetic repository/prompt；不会自动运行真实账户或模型 smoke。
 
 ## 调用示例
 

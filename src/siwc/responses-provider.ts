@@ -1,5 +1,6 @@
 import type { Provider } from "../application.js";
 import type { ModelRequest } from "../model-provider.js";
+import { CredentialDurabilityUncertainError } from "./credential-store.js";
 
 export const SIWC_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
 export const SIWC_MODELS_ENDPOINT = "https://api.openai.com/v1/models";
@@ -68,10 +69,16 @@ function safeParam(value: unknown): string | null {
 function errorDetails(body: unknown): Readonly<{ code: string | null; param: string | null }> {
   if (!isRecord(body)) return { code: null, param: null };
   const response = isRecord(body.response) ? body.response : null;
-  const nested = response && isRecord(response.error)
-    ? response.error
-    : isRecord(body.error) ? body.error : body;
-  return { code: safeCode(nested.code), param: safeParam(nested.param) };
+  const sources = [
+    response && isRecord(response.error) ? response.error : null,
+    isRecord(body.error) ? body.error : null,
+    isRecord(body.detail) ? body.detail : null,
+    body,
+  ].filter((source): source is Record<string, unknown> => source !== null);
+  return {
+    code: sources.map((source) => safeCode(source.code)).find((value) => value !== null) ?? null,
+    param: sources.map((source) => safeParam(source.param)).find((value) => value !== null) ?? null,
+  };
 }
 
 function bodyShape(body: unknown): ResponseBodyShape {
@@ -83,25 +90,44 @@ function bodyShape(body: unknown): ResponseBodyShape {
   return "object";
 }
 
-function messageForStatus(status: number, code: string | null, param: string | null): string {
+function messageForCode(code: string | null, param: string | null, status?: number): string | null {
+  const httpStatus = status === undefined ? "" : ` (HTTP ${status})`;
   if (code === "subscription_sharing_usage_limit_exceeded") {
-    return `ChatGPT plan usage limit reached. Pause plan requests and manage usage at ${SIWC_USAGE_URL}; no API-key fallback was used.`;
+    return `A ChatGPT plan or app-specific usage limit was reached${httpStatus}. This code cannot distinguish an app-specific limit from a shared plan limit and does not indicate a reset time. Pause plan requests and review the applicable limit at ${SIWC_USAGE_URL}; no API-key fallback was used.`;
   }
   if (code === "subscription_sharing_usage_unavailable") {
-    return `ChatGPT plan usage availability could not be checked (HTTP ${status}); preserve the account and retry later. No API-key fallback was used.`;
+    return `ChatGPT plan usage availability could not be checked${httpStatus}; preserve credentials and retry later with bounded backoff. No API-key fallback was used.`;
+  }
+  if (code === "subscription_sharing_user_unavailable") {
+    return `ChatGPT user or workspace information is temporarily unavailable${httpStatus}; preserve credentials and retry later with bounded backoff. No API-key fallback was used.`;
   }
   if (code === "subscription_sharing_user_not_eligible") {
-    return `ChatGPT plan usage is unavailable for this account or workspace (HTTP ${status}); no API-key fallback was used.`;
+    return `ChatGPT plan usage is unavailable for the selected user, workspace, or policy${httpStatus}; do not repeat this request or loop through OAuth. No API-key fallback was used.`;
   }
-  if (code === "unsupported_parameter" || code === "unsupported_capability" || code === "unsupported_value") {
-    return `OpenAI rejected an unsupported Responses field or capability${param ? ` (${param})` : ""} (HTTP ${status}); remove or revise that option, or select a compatible model from this account's visible model list. No API-key fallback was used.`;
+  if (code === "subscription_sharing_unsupported_capability" || code === "unsupported_parameter" || code === "unsupported_capability" || code === "unsupported_value") {
+    return `OpenAI rejected an unsupported SIWC capability${param ? ` (error.param=${param})` : "; inspect error.param"}${httpStatus}; remove or revise the unsupported input, tool, execution feature, model, or service-tier override, then retry with a changed request. Do not resend the same body; no API-key fallback was used.`;
   }
+  if (code === "subscription_sharing_route_not_supported") {
+    return `The SIWC route is not supported${httpStatus}; verify the method and URL. This integration only allows POST ${SIWC_RESPONSES_ENDPOINT}; do not switch to another route or client type. No API-key fallback was used.`;
+  }
+  if (code === "subscription_sharing_invalid_user") {
+    return `The ChatGPT subscriber context could not be validated${httpStatus}; preserve the request ID and diagnose the credential/account state. Sign in again only after confirmed revocation or a terminal refresh failure; no API-key fallback was used.`;
+  }
+  if (code === "chatpass_v2_scope_not_authorized" || code === "chatpass_v2_invalid_authorization_context") {
+    return `The signed SIWC permission context does not authorize this operation${httpStatus}; check the issued client and grant configuration. Do not blindly retry or change billing mode; no API-key fallback was used.`;
+  }
+  return null;
+}
+
+function messageForStatus(status: number, code: string | null, param: string | null): string {
+  const mapped = messageForCode(code, param, status);
+  if (mapped) return mapped;
+  if (status === 401) return "SIWC direct admission rejected the signed identity or permission (HTTP 401); check the selected account and granted scopes, and preserve the request ID for diagnosis. No API-key fallback was used.";
+  if (status === 403) return "SIWC direct admission was blocked by a policy, permission, or serving-region check (HTTP 403); verify account/client configuration and preserve the request ID. No API-key fallback was used.";
+  if (status === 503) return "SIWC direct routing or admission is temporarily unavailable (HTTP 503); preserve credentials and retry later with bounded backoff. No API-key fallback was used.";
   if (param) {
     return `OpenAI rejected Responses parameter ${param}${code ? ` (${code})` : ""} (HTTP ${status}); check the documented SIWC request fields and selected model. No API-key fallback was used.`;
   }
-  if (status === 401) return "SIWC access was not accepted (HTTP 401); check the selected account and granted scopes, then sign in again if needed. No API-key fallback was used.";
-  if (status === 403) return "SIWC request was blocked by a policy or permission check (HTTP 403); no API-key fallback was used.";
-  if (status === 503) return "SIWC direct routing is temporarily unavailable (HTTP 503); preserve credentials and retry later. No API-key fallback was used.";
   return `SIWC Responses API request failed (HTTP ${status}); no API-key fallback was used.`;
 }
 
@@ -159,15 +185,8 @@ function eventText(body: Record<string, unknown>): string {
 
 function streamFailure(body: Record<string, unknown>, requestId: string | null, status = 200): SiwcProviderError {
   const { code, param } = errorDetails(body);
-  const message = code === "subscription_sharing_usage_limit_exceeded"
-    ? `ChatGPT plan usage limit reached. Pause plan requests and manage usage at ${SIWC_USAGE_URL}; no API-key fallback was used.`
-    : code === "subscription_sharing_usage_unavailable"
-      ? `ChatGPT plan usage availability could not be checked; preserve the account and retry later at ${SIWC_USAGE_URL}. No API-key fallback was used.`
-      : code === "subscription_sharing_user_not_eligible"
-        ? "ChatGPT plan usage is unavailable for this account or workspace; no API-key fallback was used."
-        : code === "unsupported_parameter" || code === "unsupported_capability" || code === "unsupported_value"
-          ? `OpenAI rejected an unsupported Responses field or capability${param ? ` (${param})` : ""}; remove or revise it, or choose a compatible model. No API-key fallback was used.`
-          : `SIWC Responses stream ended with ${body.type === "response.incomplete" ? "response.incomplete" : "a provider error"}${code ? ` (${code})` : ""}${param ? ` for parameter ${param}` : ""}; no API-key fallback was used.`;
+  const message = messageForCode(code, param, status) ??
+    `SIWC Responses stream ended with ${body.type === "response.incomplete" ? "response.incomplete" : "a provider error"}${code ? ` (${code})` : ""}${param ? ` for parameter ${param}` : ""}; no API-key fallback was used.`;
   return new SiwcProviderError({ message, status, code, param, requestId });
 }
 
@@ -328,7 +347,10 @@ export function createSiwcResponsesProvider(options: SiwcResponsesProviderOption
       let accessToken: string;
       try {
         accessToken = await options.getAccessToken();
-      } catch {
+      } catch (error) {
+        if (error instanceof CredentialDurabilityUncertainError) {
+          throw new SiwcProviderError({ message: "SIWC 凭据文件的新内容已原子替换到目标路径，但目录同步失败、崩溃持久性未确认；本次未发起推理。请运行 `npm run siwc -- status` 检查账户状态后再决定是否重试。" });
+        }
         throw new SiwcProviderError({ message: "无法取得所选 SIWC 账户的授权；请检查本机账户状态或重新登录。未发起推理，也未输出凭据。" });
       }
       if (!accessToken) throw new SiwcProviderError({ message: "所选 SIWC 账户没有有效 access token；未发起推理。" });

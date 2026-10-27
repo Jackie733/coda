@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
-import { updateSiwcCredentialStore, accountFromStore, readSiwcCredentialStore, resolveSiwcStorePath, siwcAccountStatuses } from "./siwc/credential-store.js";
+import { CredentialDurabilityUncertainError, updateSiwcCredentialStore, accountFromStore, planUsageAuthorized, readSiwcCredentialStore, resolveSiwcStorePath, siwcAccountStatuses } from "./siwc/credential-store.js";
 import { runSiwcAuthorization, type AuthorizationOptions } from "./siwc/oauth.js";
 import { getSiwcAccessTokenForUsage, logoutSiwcAccount } from "./siwc/session.js";
 import { createSiwcResponsesProvider, listSiwcModels, SIWC_USAGE_URL, SiwcProviderError } from "./siwc/responses-provider.js";
@@ -45,6 +45,7 @@ function write(stdout: Writer, text: string): void {
 
 function safeError(error: unknown): string {
   if (error instanceof SiwcProviderError) return error.toUserMessage();
+  if (error instanceof CredentialDurabilityUncertainError) return error.message;
   return error instanceof Error ? error.message : "操作未完成；凭据未显示。";
 }
 
@@ -141,19 +142,32 @@ async function printStatus(stdout: Writer, storePath: string): Promise<void> {
 
 async function runLogin(args: readonly string[], options: SiwcCliOptions, stdout: Writer, storePath: string): Promise<number> {
   const requestPlanUsage = args.includes("--plan-usage");
-  const clientId = valueAfter(args, "--client-id");
+  const requestedClientId = valueAfter(args, "--client-id");
   const unexpected = args.filter((arg, index) => arg !== "--plan-usage" && arg !== "--client-id" && (index === 0 || args[index - 1] !== "--client-id"));
   if (unexpected.length > 0) throw new Error(`login 参数不支持：${unexpected.join(" ")}`);
   const store = await readSiwcCredentialStore(storePath);
+  const implicitAccount = !requestedClientId && store?.activeClientId === null && store.accounts.length === 1
+    ? store.accounts[0]
+    : undefined;
+  const clientId = requestedClientId ?? implicitAccount?.clientId;
   const existing = clientId ? store?.accounts.find((account) => account.clientId === clientId) : undefined;
-  if (clientId && !existing) throw new Error("--client-id 必须是 `siwc status` 显示的本机 issued client ID。");
+  if (requestedClientId && !existing) throw new Error("--client-id 必须是 `siwc status` 显示的本机 issued client ID。");
+  if (!clientId && store?.activeClientId === null && store.accounts.length > 1) {
+    throw new Error("本机有多个 SIWC 账户且当前未选择账户；为避免对错误账户重新授权，请先查看 `npm run siwc -- status`，并用 `--client-id <issued-client-id>` 明确选择。");
+  }
+  const previouslyEnabledPlanUsage = Boolean(existing && (existing.planUsageWelcomeSeen || planUsageAuthorized(existing)));
+  const showPlanUsageWelcome = requestPlanUsage && !previouslyEnabledPlanUsage;
   if (requestPlanUsage) {
-    write(stdout, "Continue with ChatGPT：首次授权说明——获准后，每次明确确认的 AI 请求会消耗本人 ChatGPT plan/credits，额度可能与其他已连接应用共享；题目与所选仓库上下文会直接发送给 OpenAI，SIWC 凭据只保存在本机，Coda 不经远端代理。\n");
+    if (showPlanUsageWelcome) {
+      write(stdout, "Continue with ChatGPT：首次启用 ChatGPT plan 的欢迎说明——获准后，每次明确确认的 AI 请求会消耗本人 ChatGPT plan/credits，额度可能与其他已连接应用共享；题目与所选仓库上下文仅在后续单独预览并经你批准推理时直接发送给 OpenAI；SIWC 凭据只保存在本机，Coda 不经远端代理。\n");
+    } else {
+      write(stdout, "Continue with ChatGPT：这是此前已启用 ChatGPT plan usage 账户的重新登录，不重复显示首次欢迎说明；后续每次推理仍会显示额度使用、共享和数据处理提示，并附 Usage 管理入口。\n");
+    }
     write(stdout, `可在此查看或管理额度：${SIWC_USAGE_URL}\n`);
   } else {
-    write(stdout, "Continue with ChatGPT：本次只请求身份 scope，不会启用 ChatGPT plan 推理。\n");
+    write(stdout, "Continue with ChatGPT：本次只请求身份 scope，不会启用 ChatGPT plan 推理。OpenAI 官方 OAuth 会处理账户标识、返回的基本资料（如 email/name）、授权 scopes 与令牌；应用只在本机保存 SIWC 凭据，Coda 不接收或远端代理。本次身份登录不会发送任务或仓库文本；这些内容仅在之后单独预览并由你批准的推理请求中，才由本机直发 OpenAI 官方 Responses API。\n");
   }
-  const needsConsent = Boolean(existing && requestPlanUsage && !existing.scopes.includes("chatgpt.tokens.use.direct"));
+  const needsConsent = Boolean(existing && requestPlanUsage && !planUsageAuthorized(existing));
   const result = await runSiwcAuthorization({
     storePath,
     ...(clientId ? { existingClientId: clientId } : {}),
