@@ -55,6 +55,8 @@ npm run inspect -- "请说明 agent 请求从哪里进入，以及主要安全�
 
 ## 本地隔离补丁 CLI（M1）
 
+安全边界：linked worktree 只隔离候选补丁的工作目录，不是 OS/container 安全沙箱；MVP 不防同一 OS 用户下的恶意并发进程或 TOCTOU 竞态。详见[安全边界与威胁模型](SECURITY.md)。
+
 补丁流程要求用户先给出具体计划和精确的仓库相对文件清单；重复 `--file` 可批准多个目标（最多 6 个）：
 
 ```bash
@@ -63,7 +65,7 @@ npm run patch -- --plan "修复 greeting 的输入校验" --file src/app.ts --fi
 
 CLI 先显示当前 `HEAD`、具体计划和精确文件范围；输入 `yes` 才批准在本地为这些文件生成候选补丁，此时尚未创建 worktree 或发送请求。之后 CLI 才创建隔离工作树、展示实际服务目标和完整最终 JSON 请求；用户再次输入 `yes` 才会原样发送一次请求。两步默认均取消，非交互终端不发送。API key 仅在第二次确认后读取。为避免混入个人本地改动，模型上下文和补丁均以 `HEAD` 为基准；源工作树的文件、index 以及 staged、unstaged 和 untracked 内容不会复制或改动。Git 会在仓库管理目录登记一个独立 linked worktree；临时工作目录只物化批准文件，请求也只包含这些文件的安全文本上下文。
 
-模型只返回结构化文本替换（`oldText` / `newText`），每项必须带理由和引用；CLI 会拒绝不在白名单内的路径、遍历/绝对路径、符号链接、`.git`/秘密路径、重复或不唯一的文本匹配、无效引用、控制字符和疑似凭据。为避免 Git pathspec 将批准路径展开为模式，文件名仅支持 ASCII 字母/数字及 `.`、`_`、`-`、`+`、`@` 字符。CLI 先创建不检出内容的 detached Git linked worktree，再用固定 HEAD 初始化隔离 index，并只通过 `checkout-index` 物化批准的精确文件；不启用 sparse checkout，也不改写共享 `.git/config`。源工作树中的秘密或其他文件不会复制到临时目录。创建/检出期间会禁用仓库自定义 Git hooks 与 clean/smudge/process filters。补丁只写进该隔离工作树，不运行 shell、模型建议的命令、测试或仓库脚本，也不会提交、推送、创建 PR 或合并。应用后会显示隔离工作树相对基准的完整 diff，再由用户输入 `keep` 保留该工作树供检查，或输入 `discard` 丢弃；非交互模式默认丢弃。失败或取消时 CLI 不会声称补丁成功，并报告隔离工作树是否仍然存在。保留结果只是本地未提交的候选补丁，不代表独立 QA 已通过。
+模型只返回结构化文本替换（`oldText` / `newText`），每项必须带理由和引用；CLI 会拒绝不在白名单内的路径、遍历/绝对路径、符号链接、`.git`/秘密路径、重复或不唯一的文本匹配、无效引用、控制字符和疑似凭据。为避免 Git pathspec 将批准路径展开为模式，文件名仅支持 ASCII 字母/数字及 `.`、`_`、`-`、`+`、`@` 字符。CLI 先创建不检出内容的 detached Git linked worktree，再用固定 HEAD 初始化隔离 index，并只通过 `checkout-index` 物化批准的精确文件；不启用 sparse checkout，也不改写共享 `.git/config`。源工作树中的秘密或其他文件不会复制到临时目录。创建/检出期间会禁用仓库自定义 Git hooks 与 clean/smudge/process filters。补丁只写进该隔离工作树，不运行 shell、模型建议的命令、测试或仓库脚本，也不会提交、推送、创建 PR 或合并。应用后会显示隔离工作树相对基准的完整 diff，再由用户输入 `keep` 保留该工作树供检查，或输入 `discard` 丢弃；非交互模式默认丢弃。失败或取消时 CLI 不会声称补丁成功，并报告隔离工作树是否仍然存在，但父临时目录删除失败可能没有单独报告（见 [issue #6](https://github.com/Jackie733/coda/issues/6)）。保留结果只是本地未提交的候选补丁，不代表独立 QA 已通过。
 
 ## 调用示例
 
@@ -106,6 +108,7 @@ npm test
 - `src/app.ts`：路由、输入校验、模型交互循环和白名单工具。
 - `src/index.ts`：读取环境变量并启动 Node.js HTTP 服务。
 - `test/app.test.ts`：接口、工具和错误路径测试。
+- `SECURITY.md`：M0/M1 安全边界、威胁模型与同 UID 范围外说明。
 - `.env.example`：环境变量模板。
 
 不要把 `.env`、API key 或其他凭据提交到 Git；仓库已忽略本地 `.env` 文件。
