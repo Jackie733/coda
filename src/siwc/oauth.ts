@@ -16,6 +16,8 @@ import {
   type SiwcCredentialStore,
   resolveSiwcStorePath,
 } from "./credential-store.js";
+import { safeCliErrorText } from "../safe-cli-error.js";
+import { isSafeSiwcRequestId, safeSiwcRequestId } from "./request-id.js";
 
 export const SIWC_ISSUER = "https://auth.openai.com";
 export const SIWC_DISCOVERY_URL = `${SIWC_ISSUER}/.well-known/openid-configuration`;
@@ -92,11 +94,6 @@ function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function safeRequestId(headers: Headers): string | undefined {
-  const value = headers.get("openai-request-id") ?? headers.get("x-request-id");
-  return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : undefined;
-}
-
 const OAUTH_ERROR_CODES = new Set([
   "invalid_request",
   "invalid_client",
@@ -105,6 +102,15 @@ const OAUTH_ERROR_CODES = new Set([
   "unsupported_grant_type",
   "invalid_scope",
 ]);
+const OAUTH_BODY_SHAPES = new Set(["error-object", "object", "array", "scalar", "empty"]);
+
+export function safeSiwcAuthorizationErrorText(error: SiwcAuthorizationError, fallback: string): string {
+  const allowlistedLiterals: string[] = [];
+  if (error.requestId && isSafeSiwcRequestId(error.requestId)) allowlistedLiterals.push(`request ID=${error.requestId}`);
+  if (error.code && OAUTH_ERROR_CODES.has(error.code)) allowlistedLiterals.push(`OAuth error=${error.code}`);
+  if (error.bodyShape && OAUTH_BODY_SHAPES.has(error.bodyShape)) allowlistedLiterals.push(`response body shape=${error.bodyShape}`);
+  return safeCliErrorText(error.message, fallback, allowlistedLiterals);
+}
 
 function oauthErrorCode(body: unknown): string | undefined {
   return record(body) && typeof body.error === "string" && OAUTH_ERROR_CODES.has(body.error)
@@ -311,7 +317,7 @@ export async function readSiwcOidcConfiguration(fetchImpl: typeof fetch = fetch)
   } catch {
     throw new SiwcAuthorizationError("无法读取 OpenAI 官方 OIDC 配置；请检查网络后重试。");
   }
-  if (!response.ok) throw new SiwcAuthorizationError("无法读取 OpenAI 官方 OIDC 配置。", { status: response.status, requestId: safeRequestId(response.headers) });
+  if (!response.ok) throw new SiwcAuthorizationError("无法读取 OpenAI 官方 OIDC 配置。", { status: response.status, requestId: safeSiwcRequestId(response.headers) ?? undefined });
   const metadata: unknown = await response.json().catch(() => null);
   if (!record(metadata)) throw new SiwcAuthorizationError("OpenAI 官方 OIDC 配置格式无效。");
   const endpoints = {
@@ -354,7 +360,7 @@ export async function verifySiwcIdToken(input: Readonly<{
     throw new SiwcAuthorizationError("无法读取 OpenAI 官方 JWKS；未保存或使用本次令牌。");
   }
   if (!jwksResponse.ok) {
-    throw new SiwcAuthorizationError("无法读取 OpenAI 官方 JWKS。", { status: jwksResponse.status, requestId: safeRequestId(jwksResponse.headers) });
+    throw new SiwcAuthorizationError("无法读取 OpenAI 官方 JWKS。", { status: jwksResponse.status, requestId: safeSiwcRequestId(jwksResponse.headers) ?? undefined });
   }
   const jwksValue: unknown = await jwksResponse.json().catch(() => null);
   if (!record(jwksValue) || !Array.isArray(jwksValue.keys)) {
@@ -450,7 +456,7 @@ export async function runSiwcAuthorization(options: AuthorizationOptions): Promi
       const code = oauthErrorCode(errorBody);
       throw new SiwcAuthorizationError(tokenExchangeFailureMessage(code, callback.clientId, options.requestPlanUsage), {
         status: tokenResponse.status,
-        requestId: safeRequestId(tokenResponse.headers),
+        requestId: safeSiwcRequestId(tokenResponse.headers) ?? undefined,
         code,
         bodyShape: oauthBodyShape(errorBody),
       });

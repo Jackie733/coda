@@ -12,6 +12,7 @@ import {
   type SiwcCredentialWriteOptions,
 } from "./credential-store.js";
 import { readSiwcOidcConfiguration, SIWC_RESOURCE, verifySiwcIdToken } from "./oauth.js";
+import { safeSiwcRequestId } from "./request-id.js";
 
 const EXPIRY_SKEW_MS = 60_000;
 const TERMINAL_REFRESH_ERRORS = new Set([
@@ -37,11 +38,6 @@ function tokenErrorCode(body: unknown): string | null {
   if (typeof error === "string") return safeCode(error);
   if (isRecord(error)) return safeCode(error.code);
   return safeCode(body.code);
-}
-
-function safeRequestId(headers: Headers): string | undefined {
-  const value = headers.get("openai-request-id") ?? headers.get("x-request-id");
-  return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : undefined;
 }
 
 function parseScopes(value: unknown, fallback: readonly string[]): readonly string[] {
@@ -136,10 +132,10 @@ export async function getSiwcAccessTokenForUsage(input: Readonly<{
             ? Object.freeze({ ...item, accessToken: null, refreshToken: null, expiresAt: null, updatedAt: new Date().toISOString() })
             : item)),
         });
-        const requestId = safeRequestId(response.headers);
+        const requestId = safeSiwcRequestId(response.headers);
         return { store: cleared, result: Object.freeze({ accessToken: null, failure: `SIWC refresh token 已失效（${code}${requestId ? `；request ID ${requestId}` : ""}）；已清除不可用令牌，请重新登录。` }) };
       }
-      const requestId = safeRequestId(response.headers);
+      const requestId = safeSiwcRequestId(response.headers);
       return { store: current, result: Object.freeze({ accessToken: null, failure: `SIWC token 刷新失败（HTTP ${response.status}${code ? `；${code}` : ""}${requestId ? `；request ID ${requestId}` : ""}）；凭据已保留。` }) };
     }
     if (!isRecord(tokenPayload)) {

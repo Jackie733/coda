@@ -2,6 +2,7 @@ import type { Provider } from "../application.js";
 import type { ModelRequest } from "../model-provider.js";
 import { safeCliErrorText } from "../safe-cli-error.js";
 import { CredentialDurabilityUncertainError } from "./credential-store.js";
+import { isSafeSiwcRequestId, safeSiwcRequestId } from "./request-id.js";
 
 export const SIWC_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
 export const SIWC_MODELS_ENDPOINT = "https://api.openai.com/v1/models";
@@ -96,7 +97,7 @@ export function safeSiwcProviderErrorText(error: SiwcProviderError, fallback: st
   // Only exact, validated structured literals are exempted; message and diagnostic detail remain scanned.
   const allowlistedLiterals = [SIWC_USAGE_URL, SIWC_RESPONSES_ENDPOINT];
   if (error.code && PUBLIC_SIWC_ERROR_CODES.has(error.code)) allowlistedLiterals.push(`error.code=${error.code}`);
-  if (error.requestId && isSafeRequestId(error.requestId)) allowlistedLiterals.push(`request ID=${error.requestId}`);
+  if (error.requestId && isSafeSiwcRequestId(error.requestId)) allowlistedLiterals.push(`request ID=${error.requestId}`);
   return safeCliErrorText(error.toUserMessage(), fallback, allowlistedLiterals);
 }
 
@@ -107,22 +108,6 @@ export type SiwcResponsesProviderOptions = Readonly<{
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isSafeRequestId(value: string): boolean {
-  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(value)) return false;
-  if (/(?:^|[._:-])(?:sk(?:[-_]|$)|sess(?:[-_]|$)|whsec_|github_pat_|gh[pousr]_|xox[baprs]-)/i.test(value)) return false;
-  if (/^(?:bearer|token|access[_-]?token|refresh[_-]?token|id[_-]?token)/i.test(value)) return false;
-  if (/(?:^|[._:-])(?:bearer|token|jwt|secret|credential|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|authorization[_-]?code|code[_-]?verifier|password)(?:$|[._:-])/i.test(value)) return false;
-  if (!/^req_/i.test(value) && /[A-Za-z0-9]{24,}/.test(value)) return false;
-  const jwtCandidate = value.replace(/^req_/i, "");
-  if (/^eyJ[A-Za-z0-9_-]{8,}\./.test(jwtCandidate) || /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/.test(jwtCandidate)) return false;
-  return true;
-}
-
-function safeRequestId(headers: Headers): string | null {
-  const value = headers.get("openai-request-id") ?? headers.get("x-request-id");
-  return value && isSafeRequestId(value) ? value : null;
 }
 
 function safeCode(value: unknown): string | null {
@@ -436,13 +421,13 @@ export async function listSiwcModels(
       code,
       param,
       detail,
-      requestId: safeRequestId(response.headers),
+      requestId: safeSiwcRequestId(response.headers),
       bodyShape: body.shape,
     });
   }
   const payload: unknown = await response.json().catch(() => null);
   if (!isRecord(payload) || !Array.isArray(payload.models)) {
-    throw new SiwcProviderError({ message: "SIWC 模型目录响应格式无效；未发起推理。", status: response.status, requestId: safeRequestId(response.headers) });
+    throw new SiwcProviderError({ message: "SIWC 模型目录响应格式无效；未发起推理。", status: response.status, requestId: safeSiwcRequestId(response.headers) });
   }
   const models: SiwcModel[] = [];
   const seen = new Set<string>();
@@ -486,7 +471,7 @@ export function createSiwcResponsesProvider(options: SiwcResponsesProviderOption
       } catch {
         throw new SiwcProviderError({ message: "SIWC Responses API 网络请求失败；未尝试其他计费模式。" });
       }
-      const requestId = safeRequestId(response.headers);
+      const requestId = safeSiwcRequestId(response.headers);
       if (!response.ok) {
         const body = await safeResponseBody(response);
         const { code, param, detail } = errorDetails(body.parsed);

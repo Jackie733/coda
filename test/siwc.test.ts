@@ -24,6 +24,8 @@ import {
   buildSiwcAuthorizationUrl,
   createPkceValues,
   runSiwcAuthorization,
+  safeSiwcAuthorizationErrorText,
+  SiwcAuthorizationError,
   SIWC_AUTHORIZATION_ENDPOINT,
   SIWC_DISCOVERY_URL,
   SIWC_IDENTITY_SCOPES,
@@ -156,14 +158,34 @@ function makeAuthorizationMocks(options: Readonly<{
   omitCallbackClientId?: boolean;
   callbackExpectedStatus?: number;
   tokenError?: Readonly<{ code: string; status?: number; requestId?: string; description?: string }>;
+  discoveryError?: Readonly<{ status: number; requestId?: string; description?: string }>;
+  jwksError?: Readonly<{ status: number; requestId?: string; description?: string }>;
 }> = {}) {
   let authorizationUrl: URL | undefined;
   let tokenExchangeCount = 0;
   let capturedTokenBody: URLSearchParams | undefined;
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
-    if (url === SIWC_DISCOVERY_URL) return Response.json(oidcMetadata());
-    if (url === `${SIWC_ISSUER}/.well-known/jwks.json`) return Response.json(syntheticJwks);
+    if (url === SIWC_DISCOVERY_URL) {
+      if (options.discoveryError) return Response.json({
+        error: "server_error",
+        ...(options.discoveryError.description ? { error_description: options.discoveryError.description } : {}),
+      }, {
+        status: options.discoveryError.status,
+        headers: options.discoveryError.requestId ? { "openai-request-id": options.discoveryError.requestId } : undefined,
+      });
+      return Response.json(oidcMetadata());
+    }
+    if (url === `${SIWC_ISSUER}/.well-known/jwks.json`) {
+      if (options.jwksError) return Response.json({
+        error: "server_error",
+        ...(options.jwksError.description ? { error_description: options.jwksError.description } : {}),
+      }, {
+        status: options.jwksError.status,
+        headers: options.jwksError.requestId ? { "openai-request-id": options.jwksError.requestId } : undefined,
+      });
+      return Response.json(syntheticJwks);
+    }
     if (url === SIWC_TOKEN_ENDPOINT) {
       tokenExchangeCount += 1;
       capturedTokenBody = new URLSearchParams(String(init?.body ?? ""));
@@ -602,6 +624,32 @@ test("valid consent denial stops before token exchange and does not save an acco
   });
 });
 
+test("OAuth authorization error formatter sanitizes the final message and allowlists only strict request IDs", () => {
+  const fallback = "SIWC 操作失败；为保护凭据，错误详情已隐藏。";
+  const maliciousRequestId = "sk-proj-syntheticsecret1234567890";
+  const tokenBearingError = new SiwcAuthorizationError(`Synthetic provider failure ${maliciousRequestId}`, {
+    status: 400,
+    requestId: maliciousRequestId,
+    code: "invalid_grant",
+    bodyShape: "error-object",
+  });
+  assert.equal(safeSiwcAuthorizationErrorText(tokenBearingError, fallback), fallback);
+
+  const requestId = "req_0123456789abcdef0123456789ab";
+  const safeError = new SiwcAuthorizationError("OpenAI refused this authorization attempt; start a fresh authorization.", {
+    status: 400,
+    requestId,
+    code: "invalid_grant",
+    bodyShape: "error-object",
+  });
+  const text = safeSiwcAuthorizationErrorText(safeError, fallback);
+  assert.match(text, /HTTP 400/);
+  assert.match(text, /OAuth error=invalid_grant/);
+  assert.match(text, /response body shape=error-object/);
+  assert.match(text, new RegExp(`request ID=${requestId}`));
+  assert.match(text, /start a fresh authorization/);
+});
+
 test("reauth without callback client_id uses the pending issued ID in token exchange and maps OAuth errors safely", async () => {
   const cases = [
     {
@@ -616,7 +664,7 @@ test("reauth without callback client_id uses the pending issued ID in token exch
   for (const item of cases) {
     await withTemporaryStore(async (storePath, root) => {
       await initializedStore(storePath);
-      const requestId = `synthetic-oauth-${item.code}`;
+      const requestId = "req_0123456789abcdef0123456789ab";
       const secretDescription = `synthetic token-bearing description ${CALLBACK_ACCESS_TOKEN}`;
       const mocks = makeAuthorizationMocks({
         ...(item.code === "invalid_grant" ? { omitCallbackClientId: true } : {}),
@@ -647,6 +695,69 @@ test("reauth without callback client_id uses the pending issued ID in token exch
       assert.match(output.value, new RegExp(`request ID=${requestId}`));
       assert.doesNotMatch(output.value, /synthetic-authorization-code/);
       assert.doesNotMatch(output.value, /synthetic token-bearing description|synthetic-access-token-never-log/);
+      const saved = await readSiwcCredentialStore(storePath);
+      const original = accountFromStore(saved!, ISSUED_CLIENT_ID);
+      assert.equal(original.accessToken, CALLBACK_ACCESS_TOKEN);
+      assert.equal(original.refreshToken, CALLBACK_REFRESH_TOKEN);
+      assert.equal(saved?.accounts.length, 1);
+    });
+  }
+});
+
+test("OAuth discovery, JWKS, and token-exchange failures sanitize request IDs through the CLI", async () => {
+  const secretDescription = `synthetic private error description ${CALLBACK_ACCESS_TOKEN}`;
+  const cases = [
+    {
+      stage: "discovery",
+      requestId: "synthetic-access-token-never-log",
+      status: 503,
+      expected: /无法读取 OpenAI 官方 OIDC 配置/,
+    },
+    {
+      stage: "jwks",
+      requestId: "sk-proj-syntheticsecret1234567890",
+      status: 503,
+      expected: /无法读取 OpenAI 官方 JWKS/,
+    },
+    {
+      stage: "token-exchange",
+      requestId: "Bearer-secretvalue0123456789abcdef",
+      status: 400,
+      expected: /丢弃本次 authorization code.*该尝试关联的 issued client ID/,
+    },
+  ] as const;
+
+  for (const item of cases) {
+    await withTemporaryStore(async (storePath, root) => {
+      await initializedStore(storePath);
+      const mocks = makeAuthorizationMocks({
+        ...(item.stage === "discovery" ? { discoveryError: { status: item.status, requestId: item.requestId, description: secretDescription } } : {}),
+        ...(item.stage === "jwks" ? { jwksError: { status: item.status, requestId: item.requestId, description: secretDescription } } : {}),
+        ...(item.stage === "token-exchange" ? { tokenError: { code: "invalid_grant", status: item.status, requestId: item.requestId, description: secretDescription } } : {}),
+      });
+      const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+      const exitCode = await runSiwcCli({
+        argv: ["login", "--plan-usage"],
+        env: { XDG_CONFIG_HOME: path.join(root, "config") },
+        stdout: output,
+        fetchImpl: mocks.fetchImpl,
+        openBrowser: mocks.openBrowser,
+      });
+
+      assert.equal(exitCode, 1);
+      assert.equal(mocks.getTokenExchangeCount(), 1);
+      assert.match(output.value, item.expected);
+      assert.match(output.value, new RegExp(`HTTP ${item.status}`));
+      assert.ok(!output.value.includes(item.requestId));
+      assert.doesNotMatch(output.value, /synthetic-access-token-never-log|synthetic private error description/);
+      if (item.stage === "token-exchange") {
+        assert.match(output.value, /OAuth error=invalid_grant/);
+        assert.match(output.value, /response body shape=error-object/);
+        assert.match(output.value, new RegExp(`npm run siwc -- login --plan-usage --client-id ${ISSUED_CLIENT_ID}`));
+        assert.doesNotMatch(output.value, /request ID=/);
+      } else {
+        assert.doesNotMatch(output.value, /OAuth error=|request ID=/);
+      }
       const saved = await readSiwcCredentialStore(storePath);
       const original = accountFromStore(saved!, ISSUED_CLIENT_ID);
       assert.equal(original.accessToken, CALLBACK_ACCESS_TOKEN);
@@ -978,8 +1089,17 @@ test("refresh token rotation is serialized across concurrent callers and replace
 test("terminal refresh failure clears unusable access and refresh tokens without printing them", async () => {
   await withTemporaryStore(async (storePath) => {
     await initializedStore(storePath, accountRecord({ expiresAt: Date.now() - 10_000 }));
-    const fetchImpl: typeof fetch = async () => Response.json({ error: "invalid_grant" }, { status: 400 });
-    await assert.rejects(getSiwcAccessTokenForUsage({ storePath, fetchImpl }), /refresh token 已失效/);
+    const maliciousRequestId = "sk-proj-syntheticsecret1234567890";
+    const fetchImpl: typeof fetch = async () => Response.json({ error: "invalid_grant" }, {
+      status: 400,
+      headers: { "openai-request-id": maliciousRequestId },
+    });
+    await assert.rejects(getSiwcAccessTokenForUsage({ storePath, fetchImpl }), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /refresh token 已失效.*invalid_grant.*请重新登录/);
+      assert.doesNotMatch(error.message, /request ID|sk-proj-syntheticsecret1234567890/);
+      return true;
+    });
     const stored = await readSiwcCredentialStore(storePath);
     const account = accountFromStore(stored!, ISSUED_CLIENT_ID);
     assert.equal(account.accessToken, null);
