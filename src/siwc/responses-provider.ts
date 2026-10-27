@@ -71,6 +71,14 @@ function safeParam(value: unknown): string | null {
   return typeof value === "string" && /^[A-Za-z0-9_.\[\]-]{1,128}$/.test(value) ? value : null;
 }
 
+function escapeBidiControls(text: string): string {
+  // Keep terminal-safety behavior aligned with visibleControls without importing readonly-cli (which imports this provider).
+  return text.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, (character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return `\\u${code.toString(16).toUpperCase().padStart(4, "0")}`;
+  });
+}
+
 function safeDiagnosticDetail(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const normalized = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim();
@@ -81,7 +89,8 @@ function safeDiagnosticDetail(value: unknown): string | null {
     /\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/.test(normalized) ||
     /https?:\/\/\S+/i.test(normalized);
   if (looksSensitive) return null;
-  return normalized.length > 240 ? `${normalized.slice(0, 239)}…` : normalized;
+  const visible = escapeBidiControls(normalized);
+  return visible.length > 240 ? `${visible.slice(0, 239)}…` : visible;
 }
 
 function errorDetails(body: unknown): Readonly<{ code: string | null; param: string | null; detail: string | null }> {

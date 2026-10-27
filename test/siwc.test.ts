@@ -1338,6 +1338,7 @@ test("a stream without response.completed fails and direct-admission detail text
     { status: 403, requestId: "synthetic-admission-nested-detail", code: "chatpass_v2_scope_not_authorized", param: "resource.invoke", nestedDetail: true, detailText: "nested private detail", expectedDetail: null },
     { status: 401, requestId: "synthetic-admission-detail-code", detailText: "invalid_grant", expectedDetail: "invalid_grant" },
     { status: 403, requestId: "synthetic-admission-control", detailText: "policy\ndenied", expectedDetail: "policy denied" },
+    { status: 403, requestId: "synthetic-admission-bidi", detailText: `safe-before${String.fromCodePoint(0x202e)}spoofed-after${String.fromCodePoint(0x2066)}left${String.fromCodePoint(0x2067)}right${String.fromCodePoint(0x2068)}first${String.fromCodePoint(0x2069)}done`, expectedDetail: "safe-before\\u202Espoofed-after\\u2066left\\u2067right\\u2068first\\u2069done" },
     { status: 403, requestId: "synthetic-admission-length", detailText: "diagnostic text ".repeat(30), expectedDetail: `${"diagnostic text ".repeat(30).slice(0, 239)}…` },
   ];
   for (const item of admissionCases) {
@@ -1346,14 +1347,14 @@ test("a stream without response.completed fails and direct-admission detail text
     const detail = nestedDetail
       ? { ...(item.code ? { code: item.code } : {}), ...(providedParam ? { param: providedParam } : {}), message: item.detailText }
       : item.detailText;
-      const provider = createSiwcResponsesProvider({
-        getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
-        fetchImpl: async () => Response.json({
-          detail,
-          ...(!nestedDetail && item.code ? { error: { code: item.code, ...(providedParam ? { param: providedParam } : {}) } } : {}),
-          ...(!nestedDetail && providedParam ? { param: providedParam } : {}),
-        }, { status: item.status, headers: { "openai-request-id": item.requestId } }),
-      });
+    const provider = createSiwcResponsesProvider({
+      getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+      fetchImpl: async () => Response.json({
+        detail,
+        ...(!nestedDetail && item.code ? { error: { code: item.code, ...(providedParam ? { param: providedParam } : {}) } } : {}),
+        ...(!nestedDetail && providedParam ? { param: providedParam } : {}),
+      }, { status: item.status, headers: { "openai-request-id": item.requestId } }),
+    });
     await assert.rejects(provider.send(responsesRequest()), (error: unknown) => {
       assert.ok(error instanceof SiwcProviderError);
       assert.equal(error.status, item.status);
@@ -1372,6 +1373,7 @@ test("a stream without response.completed fails and direct-admission detail text
       if (standardErrorObject && item.param) assert.match(message, new RegExp(`error.param=${item.param}`));
       if (nestedDetail) assert.doesNotMatch(message, /error.code=chatpass_v2_scope_not_authorized|error.param=resource\.invoke/);
       if (item.expectedDetail) assert.ok(message.includes(JSON.stringify(item.expectedDetail)));
+      assert.doesNotMatch(message, /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/);
       assert.doesNotMatch(message, /synthetic-access-token-never-log|synthetic-injected-param-secret|nested private detail/);
       return true;
     });
