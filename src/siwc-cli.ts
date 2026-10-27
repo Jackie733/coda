@@ -158,7 +158,7 @@ async function runLogin(args: readonly string[], options: SiwcCliOptions, stdout
   const requestPlanUsage = args.includes("--plan-usage");
   const requestedClientId = valueAfter(args, "--client-id");
   const unexpected = args.filter((arg, index) => arg !== "--plan-usage" && arg !== "--client-id" && (index === 0 || args[index - 1] !== "--client-id"));
-  if (unexpected.length > 0) throw new Error(`login 参数不支持：${unexpected.join(" ")}`);
+  if (unexpected.length > 0) throw new Error("login 包含不支持的参数；为保护凭据，不回显参数值。");
   const store = await readSiwcCredentialStore(storePath);
   const activeAccount = !requestedClientId && store?.activeClientId
     ? store.accounts.find((account) => account.clientId === store.activeClientId)

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import { chmod, mkdtemp, open, readFile, readdir, rm, stat, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { SignJWT, type JSONWebKeySet } from "jose";
-import { runReadonlyCli } from "../src/readonly-cli.js";
+import { runReadonlyCli, visibleControls } from "../src/readonly-cli.js";
 import {
   accountFromStore,
   assertSiwcCredentialPlatform,
@@ -514,8 +515,57 @@ test("SIWC CLI hides a token-bearing argument from its top-level error output", 
   const exitCode = await runSiwcCli({ argv: ["login", bidiSecret], stdout: output });
 
   assert.equal(exitCode, 1);
-  assert.match(output.value, /为保护凭据，错误详情已隐藏/);
-  assert.doesNotMatch(output.value, /synthetic-access-token-never-log|\u202e/);
+  assert.match(output.value, /login 包含不支持的参数；为保护凭据，不回显参数值/);
+  assert.doesNotMatch(output.value, /synthetic-access-token-never-log|access_token|\u202e|\\u202E/);
+});
+
+test("login unknown-argument CLI output is one static line for secret-like and control-split parameters", async () => {
+  await withTemporaryStore(async (_storePath, root) => {
+    const controls = [
+      { name: "tab", value: "\t" },
+      { name: "newline", value: "\n" },
+      { name: "CR", value: "\r" },
+      { name: "C1", value: "\u0085" },
+      { name: "zero-width space", value: "\u200b" },
+      { name: "left-to-right mark", value: "\u200e" },
+    ] as const;
+    const cases = [
+      { name: "short secret-like ID", args: ["oaiapp_x"], sensitive: ["oaiapp_x"] },
+      { name: "bidi slice", args: ["oaiapp_s\u202e", "k-proj"], sensitive: ["oaiapp_s", "k-proj", "sk-proj"] },
+      { name: "zero-width slice", args: ["oaiapp_s\u200b", "k-proj"], sensitive: ["oaiapp_s", "k-proj", "sk-proj"] },
+      ...controls.map((control) => ({
+        name: `${control.name} access-token marker`,
+        args: [`acce${control.value}ss_token:`, "abc12345"],
+        sensitive: ["acce", "ss_token:", "access_token", "abc12345"],
+      })),
+    ];
+    const expectedOutput = "SIWC 操作未完成：login 包含不支持的参数；为保护凭据，不回显参数值。\n";
+
+    for (const item of cases) {
+      const child = spawnSync(process.execPath, ["--import", "tsx", path.resolve("src/siwc-cli.ts"), "login", ...item.args], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        timeout: 10_000,
+        env: { ...process.env, XDG_CONFIG_HOME: path.join(root, "config") },
+      });
+      assert.equal(child.error, undefined, `${item.name}: child process did not start`);
+      assert.equal(child.status, 1, `${item.name}: unexpected exit status`);
+      const stdout = child.stdout ?? "";
+      const stderr = child.stderr ?? "";
+      assert.equal(stdout, expectedOutput, `${item.name}: error was not a single static line`);
+
+      const forbidden = new Set([
+        ...item.args,
+        ...item.args.map((arg) => visibleControls(arg)),
+        ...item.sensitive,
+        "acce\\x09ss_token:",
+      ]);
+      for (const fragment of forbidden) {
+        assert.ok(!stdout.includes(fragment), `${item.name}: stdout included ${JSON.stringify(fragment)}`);
+        assert.ok(!stderr.includes(fragment), `${item.name}: stderr included ${JSON.stringify(fragment)}`);
+      }
+    }
+  });
 });
 
 test("PKCE and dynamic authorization use the official registration contract and exact loopback URI", () => {
