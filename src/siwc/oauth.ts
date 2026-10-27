@@ -119,9 +119,17 @@ function oauthBodyShape(body: unknown): string {
   return typeof body.error === "string" ? "error-object" : "object";
 }
 
-function tokenExchangeFailureMessage(code: string | undefined): string {
+export function isSafeIssuedClientId(value: string): boolean {
+  return value !== "dynamic_agent_client" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+function tokenExchangeFailureMessage(code: string | undefined, clientId: string, requestPlanUsage: boolean): string {
   if (code === "invalid_grant") {
-    return "OpenAI 拒绝了本次授权码 (invalid_grant)；丢弃该 code，不要重试同一授权码。重新授权已有账户时运行 `npm run siwc -- login --client-id <issued-client-id> [--plan-usage]`；若这是首次动态注册，重新启动官方首次授权流程。令牌未保存。";
+    if (isSafeIssuedClientId(clientId)) {
+      const planUsageOption = requestPlanUsage ? " --plan-usage" : "";
+      return `OpenAI 拒绝了本次授权码 (invalid_grant)；已丢弃该 code，不会重试或复用。请以本次授权回调签发的 client ID ${clientId} 开始全新授权：\`npm run siwc -- login${planUsageOption} --client-id ${clientId}\`。此命令会复用该 issued ID，不会再次使用 dynamic_agent_client 注册。令牌未保存。`;
+    }
+    return "OpenAI 拒绝了本次授权码 (invalid_grant)；已丢弃且不会重试。请从 `siwc status` 复制已保存的 issued client ID 并开始全新授权；令牌未保存。";
   }
   if (code === "invalid_client") {
     return "OpenAI 拒绝了 SIWC 客户端配置 (invalid_client)；检查并修正官方 client ID/客户端配置后再开始新的授权，不要盲目重试。令牌未保存。";
@@ -249,9 +257,9 @@ async function startLoopbackListener(
       finish(() => rejectResult(new SiwcAuthorizationError("SIWC 回调缺少授权码；未发起推理。")));
       return;
     }
-    if (expectedClientId === null && (!returnedClientId || returnedClientId === "dynamic_agent_client")) {
+    if (expectedClientId === null && (!returnedClientId || !isSafeIssuedClientId(returnedClientId))) {
       response.writeHead(400, { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" }).end("Registration could not be verified. You may close this window.");
-      finish(() => rejectResult(new SiwcAuthorizationError("首次 SIWC 注册回调缺少签发的 client ID；未兑换授权码。")));
+      finish(() => rejectResult(new SiwcAuthorizationError("首次 SIWC 注册回调缺少有效签发的 client ID；未兑换授权码。")));
       return;
     }
     if (expectedClientId !== null && returnedClientId !== null && returnedClientId !== expectedClientId) {
@@ -393,15 +401,19 @@ export async function runSiwcAuthorization(options: AuthorizationOptions): Promi
   const storePath = options.storePath ?? resolveSiwcStorePath();
   const fetchImpl = options.fetchImpl ?? fetch;
   const store: SiwcCredentialStore = await ensureSiwcCredentialStore(storePath);
+  const requestedClientId = options.existingClientId;
   const existing = options.existingClientId
     ? store.accounts.find((account) => account.clientId === options.existingClientId)
     : undefined;
-  if (options.existingClientId && !existing) throw new SiwcAuthorizationError("找不到所选的 SIWC client ID；请先运行 `siwc status`。");
+  if (requestedClientId && !existing && !isSafeIssuedClientId(requestedClientId)) {
+    throw new SiwcAuthorizationError("未知 SIWC client ID 格式无效；只可显式复用 OpenAI 官方回调签发的 client ID。");
+  }
+  const clientId = existing?.clientId ?? requestedClientId ?? "dynamic_agent_client";
   const pkce = createPkceValues();
-  const listener = await startLoopbackListener(pkce.state, existing?.clientId ?? null, options.timeoutMs ?? 5 * 60_000);
+  const listener = await startLoopbackListener(pkce.state, clientId === "dynamic_agent_client" ? null : clientId, options.timeoutMs ?? 5 * 60_000);
   try {
     const authorizationUrl = buildSiwcAuthorizationUrl({
-      clientId: existing?.clientId ?? "dynamic_agent_client",
+      clientId,
       hostId: store.hostId,
       redirectUri: listener.redirectUri,
       state: pkce.state,
@@ -436,7 +448,7 @@ export async function runSiwcAuthorization(options: AuthorizationOptions): Promi
     if (!tokenResponse.ok) {
       const errorBody: unknown = await tokenResponse.json().catch(() => null);
       const code = oauthErrorCode(errorBody);
-      throw new SiwcAuthorizationError(tokenExchangeFailureMessage(code), {
+      throw new SiwcAuthorizationError(tokenExchangeFailureMessage(code, callback.clientId, options.requestPlanUsage), {
         status: tokenResponse.status,
         requestId: safeRequestId(tokenResponse.headers),
         code,
@@ -487,7 +499,7 @@ export async function runSiwcAuthorization(options: AuthorizationOptions): Promi
       updatedAt: new Date().toISOString(),
     });
     await saveSiwcAccount(storePath, account, existing?.subject);
-    return Object.freeze({ account, planUsageAuthorized: grantedPlanUsage, reusedClientId: Boolean(existing) });
+    return Object.freeze({ account, planUsageAuthorized: grantedPlanUsage, reusedClientId: clientId !== "dynamic_agent_client" });
   } finally {
     await listener.close();
   }

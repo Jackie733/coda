@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import { CredentialDurabilityUncertainError, updateSiwcCredentialStore, accountFromStore, planUsageAuthorized, readSiwcCredentialStore, resolveSiwcStorePath, siwcAccountStatuses } from "./siwc/credential-store.js";
-import { runSiwcAuthorization, type AuthorizationOptions } from "./siwc/oauth.js";
+import { isSafeIssuedClientId, runSiwcAuthorization, type AuthorizationOptions } from "./siwc/oauth.js";
 import { getSiwcAccessTokenForUsage, logoutSiwcAccount } from "./siwc/session.js";
 import { createSiwcResponsesProvider, listSiwcModels, SIWC_PLAN_USAGE_NOTICE, SIWC_USAGE_URL, SiwcProviderError } from "./siwc/responses-provider.js";
 import { runReadonlyCli, type ReadonlyCliOptions } from "./readonly-cli.js";
@@ -19,7 +19,8 @@ const USAGE = [
   "  npm run siwc -- logout [--client-id <issued-client-id>]",
   "",
   "login 默认只请求身份 scope；没有 --client-id 时优先复用活动 issued client ID，其次仅在只有一个已保存账户时复用它。",
-  "多个账户且没有活动选择时拒绝猜测；只有本机尚无账户时才使用官方 dynamic_agent_client 注册首个账户。",
+  "多个账户且没有活动选择时拒绝猜测；仅在没有保存账户且未显式给出 issued ID 时才使用官方 dynamic_agent_client 注册首个账户。",
+  "首次注册若授权码返回 invalid_grant，错误会给出回调签发 ID 与全新授权命令；用该 ID 重新授权，不会再次 dynamic-register。",
   "只有显式加 --plan-usage 才请求 ChatGPT 计划用量权限。",
   "ChatGPT plan 使用和 OpenAI API key 计费分开；不会自动兜底或切换。",
   `Manage usage：${SIWC_USAGE_URL}`,
@@ -156,7 +157,9 @@ async function runLogin(args: readonly string[], options: SiwcCliOptions, stdout
     : undefined;
   const clientId = requestedClientId ?? activeAccount?.clientId ?? soleAccount?.clientId;
   const existing = clientId ? store?.accounts.find((account) => account.clientId === clientId) : undefined;
-  if (requestedClientId && !existing) throw new Error("--client-id 必须是 `siwc status` 显示的本机 issued client ID。");
+  if (requestedClientId && !existing && !isSafeIssuedClientId(requestedClientId)) {
+    throw new Error("--client-id 必须是本机已保存的 issued ID，或首次授权失败提示中显示的 OpenAI 官方回调签发 ID。");
+  }
   if (!clientId && store?.activeClientId === null && store.accounts.length > 1) {
     throw new Error("本机有多个 SIWC 账户且当前未选择账户；为避免对错误账户重新授权，请先查看 `npm run siwc -- status`，并用 `--client-id <issued-client-id>` 明确选择。");
   }

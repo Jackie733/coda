@@ -152,6 +152,7 @@ function makeAuthorizationMocks(options: Readonly<{
   tokenClaims?: Partial<Parameters<typeof signedIdToken>[0]>;
   denial?: boolean;
   callbackClientId?: string;
+  callbackCode?: string;
   callbackExpectedStatus?: number;
   tokenError?: Readonly<{ code: string; status?: number; requestId?: string; description?: string }>;
 }> = {}) {
@@ -204,7 +205,7 @@ function makeAuthorizationMocks(options: Readonly<{
     const invalidState = await fetch(`${redirectUri}?code=synthetic-attacker-code&state=wrong-state&client_id=${callbackClientId}`);
     assert.equal(invalidState.status, 400);
     const callback = new URL(redirectUri);
-    callback.searchParams.set("code", "synthetic-authorization-code");
+    callback.searchParams.set("code", options.callbackCode ?? "synthetic-authorization-code");
     callback.searchParams.set("state", authorizationUrl.searchParams.get("state") ?? "");
     callback.searchParams.set("client_id", callbackClientId);
     const completed = await fetch(callback);
@@ -218,6 +219,20 @@ function makeAuthorizationMocks(options: Readonly<{
     getTokenBody: () => capturedTokenBody,
   };
 }
+
+test("SIWC docs state this project's local-only support and link the official interest form", async () => {
+  const documents = await Promise.all([
+    readFile(new URL("../README.md", import.meta.url), "utf8"),
+    readFile(new URL("../SECURITY.md", import.meta.url), "utf8"),
+  ]);
+  for (const document of documents) {
+    assert.match(document, /当前 Coda 的 SIWC provider 仅支持在用户控制的本机运行/);
+    assert.match(document, /不提供远端 hosted mode/);
+    assert.match(document, /不是对所有用户控制的远端 runtime 作出的禁止判断/);
+    assert.match(document, /填写 \[SIWC interest form\]\(https:\/\/openai\.com\/form\/sign-in-with-chatgpt-interest\/\)/);
+    assert.doesNotMatch(document, /必须先取得 OpenAI 要求的批准|任何付费或远程托管版本必须先满足 OpenAI 的 SIWC 审批要求/);
+  }
+});
 
 test("SIWC credential storage fails closed when Windows ACL support is unavailable", () => {
   assert.throws(() => assertSiwcCredentialPlatform("win32"), /Windows.*owner-only ACL/);
@@ -558,7 +573,7 @@ test("authorization-code exchange maps invalid_grant and invalid_client without 
   const cases = [
     {
       code: "invalid_grant",
-      expected: /丢弃该 code.*不要重试同一授权码.*npm run siwc -- login --client-id <issued-client-id> \[--plan-usage\]/,
+      expected: /丢弃.*不会重试.*全新授权/,
     },
     {
       code: "invalid_client",
@@ -584,10 +599,16 @@ test("authorization-code exchange maps invalid_grant and invalid_client without 
       assert.equal(exitCode, 1);
       assert.equal(mocks.getTokenExchangeCount(), 1);
       assert.match(output.value, item.expected);
+      if (item.code === "invalid_grant") {
+        assert.ok(output.value.includes(`client ID ${ISSUED_CLIENT_ID}`));
+        assert.match(output.value, new RegExp(`npm run siwc -- login --plan-usage --client-id ${ISSUED_CLIENT_ID}`));
+        assert.match(output.value, /不会再次使用 dynamic_agent_client 注册/);
+      }
       assert.match(output.value, new RegExp(`OAuth error=${item.code}`));
       assert.match(output.value, /HTTP 400/);
       assert.match(output.value, /response body shape=error-object/);
       assert.match(output.value, new RegExp(`request ID=${requestId}`));
+      assert.doesNotMatch(output.value, /synthetic-authorization-code/);
       assert.doesNotMatch(output.value, /synthetic token-bearing description|synthetic-access-token-never-log/);
       const saved = await readSiwcCredentialStore(storePath);
       const original = accountFromStore(saved!, ISSUED_CLIENT_ID);
@@ -596,6 +617,54 @@ test("authorization-code exchange maps invalid_grant and invalid_client without 
       assert.equal(saved?.accounts.length, 1);
     });
   }
+});
+
+test("first-registration invalid_grant reauthorizes with the issued client ID and a fresh authorization code", async () => {
+  await withTemporaryStore(async (storePath, root) => {
+    const first = makeAuthorizationMocks({
+      callbackCode: "synthetic-old-authorization-code",
+      tokenError: { code: "invalid_grant", status: 400 },
+    });
+    const firstOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    const env = { XDG_CONFIG_HOME: path.join(root, "config") };
+    assert.equal(await runSiwcCli({
+      argv: ["login", "--plan-usage"],
+      env,
+      stdout: firstOutput,
+      fetchImpl: first.fetchImpl,
+      openBrowser: first.openBrowser,
+    }), 1);
+    const firstAuthorization = first.getAuthorizationUrl();
+    assert.ok(firstAuthorization);
+    assert.equal(firstAuthorization.searchParams.get("client_id"), "dynamic_agent_client");
+    assert.equal(first.getTokenBody()?.get("client_id"), ISSUED_CLIENT_ID);
+    assert.equal(first.getTokenBody()?.get("code"), "synthetic-old-authorization-code");
+    assert.equal(first.getTokenExchangeCount(), 1);
+    assert.ok(firstOutput.value.includes(`client ID ${ISSUED_CLIENT_ID}`));
+    assert.match(firstOutput.value, new RegExp(`npm run siwc -- login --plan-usage --client-id ${ISSUED_CLIENT_ID}`));
+    assert.doesNotMatch(firstOutput.value, /synthetic-old-authorization-code/);
+    assert.equal((await readSiwcCredentialStore(storePath))?.accounts.length, 0);
+
+    const retry = makeAuthorizationMocks({ callbackCode: "synthetic-fresh-authorization-code" });
+    const retryOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({
+      argv: ["login", "--plan-usage", "--client-id", ISSUED_CLIENT_ID],
+      env,
+      stdout: retryOutput,
+      fetchImpl: retry.fetchImpl,
+      openBrowser: retry.openBrowser,
+    }), 0);
+    const retryAuthorization = retry.getAuthorizationUrl();
+    assert.ok(retryAuthorization);
+    assert.equal(retryAuthorization.searchParams.get("client_id"), ISSUED_CLIENT_ID);
+    assert.notEqual(retryAuthorization.searchParams.get("client_id"), "dynamic_agent_client");
+    assert.equal(retryAuthorization.searchParams.has("agent_name_hint"), false);
+    assert.equal(retry.getTokenBody()?.get("client_id"), ISSUED_CLIENT_ID);
+    assert.equal(retry.getTokenBody()?.get("code"), "synthetic-fresh-authorization-code");
+    assert.notEqual(retry.getTokenBody()?.get("code"), first.getTokenBody()?.get("code"));
+    assert.equal(retry.getTokenExchangeCount(), 1);
+    assert.equal((await readSiwcCredentialStore(storePath))?.accounts[0]?.clientId, ISSUED_CLIENT_ID);
+  });
 });
 
 test("reauthorization rejects a callback client ID that does not match the selected account", async () => {

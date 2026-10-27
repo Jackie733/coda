@@ -12,7 +12,7 @@ M1 先要求用户批准具体计划和精确文件范围，再单独批准最�
 
 ### 可选 SIWC / ChatGPT plan provider（issue #10）
 
-SIWC 是仅供用户在本人本机运行的开源 Coda 使用的可选 provider，不是一般用途的 API 代理，也不允许共享/转让/轮换订阅、为其他人转发请求或汇聚多个账户。该功能没有 Coda paywall；任何付费或远程托管版本必须先满足 OpenAI 的 SIWC 审批要求。授权只能通过 OpenAI 官方 Sign in with ChatGPT 流程取得；禁止索取 ChatGPT 密码/cookie、读取浏览器会话或使用 Codex 私有凭据缓存。
+当前 Coda 的 SIWC provider 仅支持在用户控制的本机运行，不提供远端 hosted mode；这是本项目当前的产品范围，不是对所有用户控制的远端 runtime 作出的禁止判断。该 provider 不是一般用途的 API 代理，也不用于共享、转让、轮换订阅、为他人转发请求或汇聚多个账户；当前没有 Coda paywall。若计划提供付费或远端托管产品，OpenAI 官方 SIWC 文档指引开发者填写 [SIWC interest form](https://openai.com/form/sign-in-with-chatgpt-interest/) 并遵循后续指引。授权只能通过 OpenAI 官方 Sign in with ChatGPT 流程取得；禁止索取 ChatGPT 密码/cookie、读取浏览器会话或使用 Codex 私有凭据缓存。
 
 身份登录与计划推理授权分开。identity-only OAuth 在打开授权页前说明会处理 OpenAI 返回的账户标识、可选 email/name、授权 scopes 与令牌；本机运行的 Coda 进程接收官方 OAuth 回调、用授权码换取并处理 SIWC 凭据，将其保存在用户控制的本机目录。凭据不会发送到 Coda 远端服务。身份登录本身不发送任务或仓库上下文；后者只会在之后单独预览并获用户批准的推理中，由本机直接发送到 OpenAI 官方 Responses API，不经 Coda 远端代理。只有用户明确运行 `npm run siwc -- login --plan-usage` 并在官方页面同意、且返回的实际授权 scope 包含 `chatgpt.tokens.use.direct` 与 `resource.invoke`，本机才允许发起计划请求。首次启用时显示一次 plan-use 欢迎说明，并把已展示状态留在本机账户记录中；后续重登（包括 logout 后）不重复欢迎。每次模型请求仍有独立预览/确认门，持续显示正在使用 ChatGPT 方案额度和官方 Usage 链接；API-key 与 SIWC provider 的 endpoint、凭据与计费描述互不混用。
 

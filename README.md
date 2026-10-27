@@ -78,7 +78,7 @@ CLI 先显示当前 `HEAD`、具体计划和精确文件范围；输入 `yes` �
 
 ## 可选 SIWC / ChatGPT plan provider（本机、明确授权）
 
-该 provider 只供用户在本人本机运行的开源 Coda 使用；它不是通用代理，不用于共享、转让、轮换或代他人消耗计划额度，也没有 Coda paywall。付费或远程托管服务若要接入 SIWC，必须先取得 OpenAI 要求的批准。登录只会打开 OpenAI 官方 SIWC 授权流程；不要提供 ChatGPT 密码/cookie，也不会读取浏览器会话或 Codex 私有缓存。
+当前 Coda 的 SIWC provider 仅支持在用户控制的本机运行，不提供远端 hosted mode；这是本项目当前的产品范围，不是对所有用户控制的远端 runtime 作出的禁止判断。该 provider 不是通用代理，不用于共享、转让、轮换或代他人消耗计划额度，也没有 Coda paywall。若计划提供付费或远端托管产品，OpenAI 官方 SIWC 文档指引开发者填写 [SIWC interest form](https://openai.com/form/sign-in-with-chatgpt-interest/) 并遵循后续指引。登录只会打开 OpenAI 官方 SIWC 授权流程；不要提供 ChatGPT 密码/cookie，也不会读取浏览器会话或 Codex 私有缓存。
 
 ```bash
 # 只登录身份，不请求计划推理授权
@@ -93,6 +93,8 @@ npm run siwc -- models
 npm run siwc -- inspect --model <从 models 返回的 slug> "请说明入口与安全边界"
 npm run siwc -- logout
 ```
+
+若首次授权的 token exchange 返回 `invalid_grant`，旧 authorization code 会被丢弃；错误提示会显示该回调签发的 client ID。使用 `npm run siwc -- login --plan-usage --client-id <issued-id>` 开始全新授权，继续复用该 ID，不会再次使用 `dynamic_agent_client` 注册。
 
 只有 `login --plan-usage` 才请求 `chatgpt.tokens.use.direct`（以及官方流程所需的资源/刷新 scopes）；身份登录或缺少实际授予的 plan-use scope 都不能发起计划推理。普通 `login` 默认复用活动账户的已签发 client ID；无活动账户时仅在本机只有一个已保存账户时复用它。多账户且没有活动选择时会 fail closed；可先用 `status` 查看并运行 `select <issued-client-id>`，或显式提供 `--client-id <issued-client-id>`。只有本机尚无已保存账户时才使用官方 `dynamic_agent_client` 注册首个账户；之后复用回调签发的 client ID，不会因普通登录静默新增账户。模型列表来自所选账户当前可见的官方 `/v1/models` 目录，交互终端可选择，非交互终端须显式传 `--model`。
 
