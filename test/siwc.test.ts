@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, stat, symlink } from "node:fs/promises";
+import { chmod, mkdtemp, open, readFile, readdir, rm, stat, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,6 +17,7 @@ import {
   SIWC_REFRESH_SCOPE,
   SIWC_RESOURCE_SCOPE,
   type SiwcAccountRecord,
+  writeSiwcCredentialStoreAtomically,
 } from "../src/siwc/credential-store.js";
 import {
   buildSiwcAuthorizationUrl,
@@ -41,6 +42,7 @@ import {
 } from "../src/siwc/responses-provider.js";
 import { getSiwcAccessTokenForUsage, logoutSiwcAccount } from "../src/siwc/session.js";
 import { readSiwcTuiStatus } from "../src/siwc/ui-status.js";
+import { runSiwcCli } from "../src/siwc-cli.js";
 
 const ISSUED_CLIENT_ID = "oaiapp_synthetic_client";
 const CALLBACK_ACCESS_TOKEN = "synthetic-access-token-never-log";
@@ -212,6 +214,36 @@ test("SIWC credential storage fails closed when Windows ACL support is unavailab
 });
 
 if (process.platform !== "win32") {
+test("first plan-use login discloses consumption, sharing, and direct data flow before opening authorization", async () => {
+  await withTemporaryStore(async (_storePath, root) => {
+    const mocks = makeAuthorizationMocks();
+    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    let disclosureWasVisibleBeforeBrowser = false;
+    const exitCode = await runSiwcCli({
+      argv: ["login", "--plan-usage"],
+      env: { XDG_CONFIG_HOME: path.join(root, "config") },
+      stdout: output,
+      fetchImpl: mocks.fetchImpl,
+      openBrowser: async (url) => {
+        disclosureWasVisibleBeforeBrowser = /首次授权说明/.test(output.value) &&
+          /额度可能与其他已连接应用共享/.test(output.value) &&
+          /题目与所选仓库上下文会直接发送给 OpenAI/.test(output.value) &&
+          /SIWC 凭据只保存在本机/.test(output.value) &&
+          /Coda 不经远端代理/.test(output.value) &&
+          output.value.includes(SIWC_USAGE_URL);
+        await mocks.openBrowser(url);
+      },
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(disclosureWasVisibleBeforeBrowser, true);
+    assert.match(output.value, /会消耗本人 ChatGPT plan\/credits/);
+    assert.match(output.value, /题目与所选仓库上下文会直接发送给 OpenAI/);
+    assert.match(output.value, /SIWC 凭据只保存在本机/);
+    assert.match(output.value, /Coda 不经远端代理/);
+    assert.match(output.value, new RegExp(SIWC_USAGE_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  });
+});
+
 test("PKCE and dynamic authorization use the official registration contract and exact loopback URI", () => {
   const pkce = createPkceValues();
   assert.ok(pkce.state.length >= 43);
@@ -397,6 +429,50 @@ test("credential reads reject permissive local directories/files and symbolic li
   });
 });
 
+test("temporary-file close failure removes secret temp file and preserves original credentials", async () => {
+  await withTemporaryStore(async (storePath) => {
+    await initializedStore(storePath, accountRecord({ accessToken: "synthetic-original-access-token" }));
+    const originalContents = await readFile(storePath, "utf8");
+    const originalStore = await readSiwcCredentialStore(storePath);
+    assert.ok(originalStore);
+    const attemptedSecret = "synthetic-close-failure-token-never-log";
+    const attemptedStore = Object.freeze({
+      ...originalStore,
+      accounts: Object.freeze(originalStore.accounts.map((account) => Object.freeze({
+        ...account,
+        accessToken: attemptedSecret,
+        refreshToken: attemptedSecret,
+      }))),
+    });
+    await assert.rejects(writeSiwcCredentialStoreAtomically(storePath, attemptedStore, {
+      openTemporaryFile: async (temporaryPath) => {
+        const handle = await open(temporaryPath, "wx", 0o600);
+        return {
+          writeFile: async (data: string, encoding: "utf8") => { await handle.writeFile(data, encoding); },
+          sync: () => handle.sync(),
+          chmod: (mode: number) => handle.chmod(mode),
+          truncate: (length?: number) => handle.truncate(length),
+          close: async () => {
+            await handle.close();
+            throw new Error(`synthetic close failure ${attemptedSecret}`);
+          },
+        };
+      },
+    }), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /原凭据未替换/);
+      assert.doesNotMatch(error.message, /synthetic-close-failure-token-never-log/);
+      assert.doesNotMatch(error.stack ?? "", /synthetic-close-failure-token-never-log/);
+      return true;
+    });
+    assert.equal(await readFile(storePath, "utf8"), originalContents);
+    assert.deepEqual((await readdir(path.dirname(storePath))).filter((name) => name.endsWith(".tmp")), []);
+    const stillStored = await readSiwcCredentialStore(storePath);
+    assert.equal(stillStored?.accounts[0]?.accessToken, "synthetic-original-access-token");
+    assert.ok(!originalContents.includes(attemptedSecret));
+  });
+});
+
 test("refresh token rotation is serialized across concurrent callers and replaces the whole token set", async () => {
   await withTemporaryStore(async (storePath) => {
     await initializedStore(storePath, accountRecord({ expiresAt: Date.now() - 10_000 }));
@@ -574,6 +650,115 @@ test("Responses provider sends only the documented public SSE request and succee
   assert.deepEqual(await response.json(), { output_text: modelText });
 });
 
+test("token-bearing token retrieval errors are sanitized before provider errors and CLI output", async () => {
+  const syntheticSecret = "synthetic-access-token-error-secret-never-log";
+  let networkCalls = 0;
+  const provider = createSiwcResponsesProvider({
+    getAccessToken: async () => { throw new Error(`synthetic OAuth error included ${syntheticSecret}`); },
+    fetchImpl: async () => { networkCalls += 1; throw new Error("must not reach network"); },
+  });
+  await assert.rejects(provider.send(responsesRequest()), (error: unknown) => {
+    assert.ok(error instanceof SiwcProviderError);
+    assert.match(error.message, /无法取得所选 SIWC 账户的授权/);
+    assert.doesNotMatch(error.message, /synthetic-access-token-error-secret-never-log/);
+    assert.doesNotMatch(error.stack ?? "", /synthetic-access-token-error-secret-never-log/);
+    return true;
+  });
+
+  const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+  const exitCode = await runReadonlyCli({
+    cwd: "/synthetic/repository",
+    requestMode: "siwc",
+    model: "synthetic-current-slug",
+    env: {},
+    inspect: async () => syntheticSnapshot,
+    stdout: output,
+    confirmSend: async () => true,
+    provider,
+  });
+  assert.equal(exitCode, 1);
+  assert.match(output.value, /模型请求未完成/);
+  assert.doesNotMatch(output.value, /synthetic-access-token-error-secret-never-log/);
+  assert.equal(networkCalls, 0);
+});
+
+test("SSE parser handles complete and one-byte CRLF/CR/LF streams and only completes on response.completed", async () => {
+  const sample = 'event: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"ok"}\r\n\r\nevent: response.completed\r\ndata: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}}\r\n\r\n';
+  const encoder = new TextEncoder();
+  const crlfBytes = encoder.encode(sample);
+  const variants = [
+    { name: "complete CRLF block", chunks: [crlfBytes] },
+    { name: "single-byte CRLF chunks", chunks: Array.from(crlfBytes, (byte) => new Uint8Array([byte])) },
+    { name: "single-byte standalone CR chunks", chunks: Array.from(encoder.encode(sample.replace(/\r\n/g, "\r")), (byte) => new Uint8Array([byte])) },
+    { name: "single-byte LF chunks", chunks: Array.from(encoder.encode(sample.replace(/\r\n/g, "\n")), (byte) => new Uint8Array([byte])) },
+  ];
+  for (const variant of variants) {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of variant.chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const provider = createSiwcResponsesProvider({
+      getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+      fetchImpl: async () => new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+    });
+    const response = await provider.send(responsesRequest());
+    assert.deepEqual(await response.json(), { output_text: "ok" }, variant.name);
+  }
+
+  const doneOnly = createSiwcResponsesProvider({
+    getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+    fetchImpl: async () => new Response("data: [DONE]\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+  });
+  await assert.rejects(doneOnly.send(responsesRequest()), /without response.completed/);
+  const incomplete = createSiwcResponsesProvider({
+    getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+    fetchImpl: async () => new Response(sseEvent("response.incomplete", { response: { status: "incomplete" } }), {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    }),
+  });
+  await assert.rejects(incomplete.send(responsesRequest()), /response.incomplete/);
+});
+
+test("Responses API errors preserve safe error.code and error.param with actionable capability guidance", async () => {
+  const provider = createSiwcResponsesProvider({
+    getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+    fetchImpl: async () => Response.json({
+      error: { code: "unsupported_capability", param: "tools", message: "synthetic raw provider detail" },
+    }, { status: 400 }),
+  });
+  await assert.rejects(provider.send(responsesRequest()), (error: unknown) => {
+    assert.ok(error instanceof SiwcProviderError);
+    assert.equal(error.code, "unsupported_capability");
+    assert.equal(error.param, "tools");
+    const userMessage = error.toUserMessage();
+    assert.match(userMessage, /unsupported Responses field or capability/i);
+    assert.match(userMessage, /tools/);
+    assert.match(userMessage, /error.code=unsupported_capability/);
+    assert.match(userMessage, /error.param=tools/);
+    assert.doesNotMatch(userMessage, /synthetic raw provider detail/);
+    return true;
+  });
+  const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+  const exitCode = await runReadonlyCli({
+    cwd: "/synthetic/repository",
+    requestMode: "siwc",
+    model: "synthetic-current-slug",
+    env: {},
+    inspect: async () => syntheticSnapshot,
+    stdout: output,
+    confirmSend: async () => true,
+    provider,
+  });
+  assert.equal(exitCode, 1);
+  assert.match(output.value, /unsupported Responses field or capability/);
+  assert.match(output.value, /error.code=unsupported_capability/);
+  assert.match(output.value, /error.param=tools/);
+  assert.doesNotMatch(output.value, /synthetic raw provider detail/);
+});
+
 test("Responses provider refuses system-role input and preview-only unsupported fields before token access", async () => {
   let tokenReads = 0;
   let networkCalls = 0;
@@ -586,7 +771,7 @@ test("Responses provider refuses system-role input and preview-only unsupported 
   const systemRole = JSON.stringify(systemRoleBody);
   await assert.rejects(provider.send(responsesRequest(systemRole)), /explicit system.*rejected/);
   const unsupported = JSON.stringify({ model: "x", instructions: "i", input: [], previous_response_id: "old", store: false, stream: true });
-  await assert.rejects(provider.send(responsesRequest(unsupported)), /unsupported by the current plan-usage preview/);
+  await assert.rejects(provider.send(responsesRequest(unsupported)), /unsupported by the current plan-usage preview.*previous_response_id.*remove that field/);
   assert.equal(tokenReads, 0);
   assert.equal(networkCalls, 0);
 });
@@ -683,6 +868,11 @@ test("readonly CLI previews SIWC JSON without API key, sends only after approval
   assert.equal(keyRead, false);
   assert.equal(sentAuthorization, `Bearer ${CALLBACK_ACCESS_TOKEN}`);
   assert.ok(output.value.includes("ChatGPT plan"));
+  assert.match(output.value, /正在使用 ChatGPT 方案额度/);
+  assert.match(output.value, /本次请求会消耗所选账户额度/);
+  assert.match(output.value, /额度可能与其他已连接应用共享/);
+  assert.match(output.value, /任务与所选仓库上下文会在你批准后直接发送给 OpenAI 官方 Responses API/);
+  assert.match(output.value, /Coda 不经远端代理/);
   assert.ok(output.value.includes(SIWC_USAGE_URL));
   assert.ok(output.value.includes(capturedRequest));
   assert.ok(!capturedRequest.includes(CALLBACK_ACCESS_TOKEN));

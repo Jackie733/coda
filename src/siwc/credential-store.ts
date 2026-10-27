@@ -48,6 +48,19 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 type Environment = Readonly<Record<string, string | undefined>>;
 type StoreMutation = (current: SiwcCredentialStore) => SiwcCredentialStore;
 
+export type SiwcTemporaryFileHandle = Readonly<{
+  writeFile: (data: string, encoding: "utf8") => Promise<void>;
+  sync: () => Promise<void>;
+  chmod: (mode: number) => Promise<void>;
+  truncate: (length?: number) => Promise<void>;
+  close: () => Promise<void>;
+}>;
+
+export type SiwcCredentialWriteOptions = Readonly<{
+  /** Internal fault-injection seam; production callers should omit this option. */
+  openTemporaryFile?: (filePath: string) => Promise<SiwcTemporaryFileHandle>;
+}>;
+
 export function resolveSiwcStorePath(env: Environment = process.env): string {
   const configuredHome = env.XDG_CONFIG_HOME;
   const configHome = configuredHome && path.isAbsolute(configuredHome)
@@ -180,32 +193,70 @@ export async function readSiwcCredentialStore(storePath = resolveSiwcStorePath()
   return readUnlocked(storePath);
 }
 
-async function writeUnlocked(storePath: string, store: SiwcCredentialStore): Promise<void> {
+async function writeAtomicFile(
+  storePath: string,
+  store: SiwcCredentialStore,
+  openTemporaryFile: (filePath: string) => Promise<SiwcTemporaryFileHandle> = (filePath) => open(filePath, "wx", FILE_MODE),
+): Promise<void> {
   await ensurePrivateDirectory(storePath);
   const checked = validateStore(store);
   const temporaryPath = `${storePath}.${process.pid}.${randomUUID()}.tmp`;
-  const handle = await open(temporaryPath, "wx", FILE_MODE);
+  let handle: SiwcTemporaryFileHandle;
+  try {
+    handle = await openTemporaryFile(temporaryPath);
+  } catch {
+    throw new Error("无法安全创建 SIWC 凭据临时文件；原凭据未替换。");
+  }
+
+  let writeFailed = false;
   try {
     await handle.writeFile(`${JSON.stringify(checked, null, 2)}\n`, "utf8");
     await handle.sync();
     if (process.platform !== "win32") await handle.chmod(FILE_MODE);
-  } catch (error) {
-    await rm(temporaryPath, { force: true });
-    throw error;
-  } finally {
-    await handle.close();
+  } catch {
+    writeFailed = true;
   }
+
+  let closeFailed = false;
+  try {
+    await handle.close();
+  } catch {
+    closeFailed = true;
+  }
+
+  if (writeFailed || closeFailed) {
+    try { await handle.truncate(0); await handle.sync(); } catch { /* best-effort zeroing before unlink */ }
+    try { await handle.close(); } catch { /* close may already have completed before rejecting */ }
+    let cleaned = true;
+    try { await rm(temporaryPath, { force: true }); } catch { cleaned = false; }
+    throw new Error(cleaned
+      ? "SIWC 凭据原子写入失败；原凭据未替换，临时文件已清理。"
+      : "SIWC 凭据原子写入失败；原凭据未替换，但临时文件清理未能确认，请检查本机凭据目录。");
+  }
+
   try {
     await rename(temporaryPath, storePath);
-    if (process.platform !== "win32") await chmod(storePath, FILE_MODE);
     if (process.platform !== "win32") {
       const directoryHandle = await open(path.dirname(storePath), "r");
-      try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+      try { await directoryHandle.sync(); } finally { await directoryHandle.close().catch(() => undefined); }
     }
-  } catch (error) {
-    await rm(temporaryPath, { force: true });
-    throw error;
+  } catch {
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    throw new Error("SIWC 凭据原子替换或目录同步失败；请重新检查本机凭据状态。");
   }
+}
+
+async function writeUnlocked(storePath: string, store: SiwcCredentialStore): Promise<void> {
+  return writeAtomicFile(storePath, store);
+}
+
+/** @internal Exposes the same locked atomic writer with an injectable temp-file handle for failure tests. */
+export async function writeSiwcCredentialStoreAtomically(
+  storePath: string,
+  store: SiwcCredentialStore,
+  options: SiwcCredentialWriteOptions = {},
+): Promise<void> {
+  return withSiwcStoreLock(storePath, () => writeAtomicFile(storePath, store, options.openTemporaryFile));
 }
 
 export async function withSiwcStoreLock<T>(storePath: string, operation: () => Promise<T>): Promise<T> {

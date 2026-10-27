@@ -44,15 +44,7 @@ function write(stdout: Writer, text: string): void {
 }
 
 function safeError(error: unknown): string {
-  if (error instanceof SiwcProviderError) {
-    const details = [
-      error.status === null ? null : `HTTP ${error.status}`,
-      error.code ? `code ${error.code}` : null,
-      error.bodyShape ? `response body shape ${error.bodyShape}` : null,
-      error.requestId ? `request ID ${error.requestId}` : null,
-    ].filter(Boolean);
-    return `${error.message}${details.length ? `\n诊断信息：${details.join("；")}` : ""}`;
-  }
+  if (error instanceof SiwcProviderError) return error.toUserMessage();
   return error instanceof Error ? error.message : "操作未完成；凭据未显示。";
 }
 
@@ -156,7 +148,7 @@ async function runLogin(args: readonly string[], options: SiwcCliOptions, stdout
   const existing = clientId ? store?.accounts.find((account) => account.clientId === clientId) : undefined;
   if (clientId && !existing) throw new Error("--client-id 必须是 `siwc status` 显示的本机 issued client ID。");
   if (requestPlanUsage) {
-    write(stdout, "Continue with ChatGPT：浏览器将请求计划用量授权；若获准，AI 请求会使用本人 ChatGPT plan/credits，额度可能与其他已连接应用共享。\n");
+    write(stdout, "Continue with ChatGPT：首次授权说明——获准后，每次明确确认的 AI 请求会消耗本人 ChatGPT plan/credits，额度可能与其他已连接应用共享；题目与所选仓库上下文会直接发送给 OpenAI，SIWC 凭据只保存在本机，Coda 不经远端代理。\n");
     write(stdout, `可在此查看或管理额度：${SIWC_USAGE_URL}\n`);
   } else {
     write(stdout, "Continue with ChatGPT：本次只请求身份 scope，不会启用 ChatGPT plan 推理。\n");

@@ -11,12 +11,14 @@ export type ResponseBodyShape = "error-object" | "detail-object" | "object" | "a
 export class SiwcProviderError extends Error {
   readonly status: number | null;
   readonly code: string | null;
+  readonly param: string | null;
   readonly requestId: string | null;
   readonly bodyShape: ResponseBodyShape | null;
   constructor(input: Readonly<{
     message: string;
     status?: number | null;
     code?: string | null;
+    param?: string | null;
     requestId?: string | null;
     bodyShape?: ResponseBodyShape | null;
   }>) {
@@ -24,8 +26,20 @@ export class SiwcProviderError extends Error {
     this.name = "SiwcProviderError";
     this.status = input.status ?? null;
     this.code = input.code ?? null;
+    this.param = input.param ?? null;
     this.requestId = input.requestId ?? null;
     this.bodyShape = input.bodyShape ?? null;
+  }
+
+  toUserMessage(): string {
+    const details = [
+      this.status === null ? null : `HTTP ${this.status}`,
+      this.code ? `error.code=${this.code}` : null,
+      this.param ? `error.param=${this.param}` : null,
+      this.bodyShape ? `response body shape=${this.bodyShape}` : null,
+      this.requestId ? `request ID=${this.requestId}` : null,
+    ].filter(Boolean);
+    return `${this.message}${details.length ? `\n诊断信息：${details.join("；")}` : ""}`;
   }
 }
 
@@ -47,10 +61,17 @@ function safeCode(value: unknown): string | null {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,96}$/.test(value) ? value : null;
 }
 
-function errorCode(body: unknown): string | null {
-  if (!isRecord(body)) return null;
-  const nested = body.error;
-  return isRecord(nested) ? safeCode(nested.code) : safeCode(body.code);
+function safeParam(value: unknown): string | null {
+  return typeof value === "string" && /^[A-Za-z0-9_.\[\]-]{1,128}$/.test(value) ? value : null;
+}
+
+function errorDetails(body: unknown): Readonly<{ code: string | null; param: string | null }> {
+  if (!isRecord(body)) return { code: null, param: null };
+  const response = isRecord(body.response) ? body.response : null;
+  const nested = response && isRecord(response.error)
+    ? response.error
+    : isRecord(body.error) ? body.error : body;
+  return { code: safeCode(nested.code), param: safeParam(nested.param) };
 }
 
 function bodyShape(body: unknown): ResponseBodyShape {
@@ -62,7 +83,7 @@ function bodyShape(body: unknown): ResponseBodyShape {
   return "object";
 }
 
-function messageForStatus(status: number, code: string | null): string {
+function messageForStatus(status: number, code: string | null, param: string | null): string {
   if (code === "subscription_sharing_usage_limit_exceeded") {
     return `ChatGPT plan usage limit reached. Pause plan requests and manage usage at ${SIWC_USAGE_URL}; no API-key fallback was used.`;
   }
@@ -71,6 +92,12 @@ function messageForStatus(status: number, code: string | null): string {
   }
   if (code === "subscription_sharing_user_not_eligible") {
     return `ChatGPT plan usage is unavailable for this account or workspace (HTTP ${status}); no API-key fallback was used.`;
+  }
+  if (code === "unsupported_parameter" || code === "unsupported_capability" || code === "unsupported_value") {
+    return `OpenAI rejected an unsupported Responses field or capability${param ? ` (${param})` : ""} (HTTP ${status}); remove or revise that option, or select a compatible model from this account's visible model list. No API-key fallback was used.`;
+  }
+  if (param) {
+    return `OpenAI rejected Responses parameter ${param}${code ? ` (${code})` : ""} (HTTP ${status}); check the documented SIWC request fields and selected model. No API-key fallback was used.`;
   }
   if (status === 401) return "SIWC access was not accepted (HTTP 401); check the selected account and granted scopes, then sign in again if needed. No API-key fallback was used.";
   if (status === 403) return "SIWC request was blocked by a policy or permission check (HTTP 403); no API-key fallback was used.";
@@ -88,8 +115,10 @@ function validateResponsesRequest(request: ModelRequest): void {
   }
   if (!isRecord(body)) throw new SiwcProviderError({ message: "SIWC Responses request must be a JSON object." });
   const allowedFields = new Set(["model", "instructions", "input", "text", "store", "stream"]);
-  if (Object.keys(body).some((key) => !allowedFields.has(key))) {
-    throw new SiwcProviderError({ message: "SIWC Responses request contains a field unsupported by the current plan-usage preview." });
+  const unsupportedField = Object.keys(body).find((key) => !allowedFields.has(key));
+  if (unsupportedField) {
+    const field = safeParam(unsupportedField);
+    throw new SiwcProviderError({ message: `SIWC Responses request contains a field unsupported by the current plan-usage preview${field ? ` (${field})` : ""}; remove that field before retrying.` });
   }
   if (typeof body.model !== "string" || !body.model || body.store !== false || body.stream !== true ||
       !Array.isArray(body.input) || body.input.length === 0 || typeof body.instructions !== "string" || !body.instructions ||
@@ -99,8 +128,15 @@ function validateResponsesRequest(request: ModelRequest): void {
     throw new SiwcProviderError({ message: "SIWC Responses request must use instructions, input, strict JSON schema, store:false, and stream:true." });
   }
   for (const item of body.input) {
-    if (!isRecord(item) || Object.keys(item).some((key) => key !== "role" && key !== "content") ||
-        item.role !== "user" || typeof item.content !== "string" || !item.content) {
+    if (!isRecord(item)) {
+      throw new SiwcProviderError({ message: "The current SIWC preview accepts only plain user input; explicit system or unsupported input types are rejected." });
+    }
+    const unsupportedInputField = Object.keys(item).find((key) => key !== "role" && key !== "content");
+    if (unsupportedInputField) {
+      const field = safeParam(unsupportedInputField);
+      throw new SiwcProviderError({ message: `The current SIWC preview rejects unsupported input field${field ? ` ${field}` : ""}; use plain user text only.` });
+    }
+    if (item.role !== "user" || typeof item.content !== "string" || !item.content) {
       throw new SiwcProviderError({ message: "The current SIWC preview accepts only plain user input; explicit system or unsupported input types are rejected." });
     }
   }
@@ -122,19 +158,17 @@ function eventText(body: Record<string, unknown>): string {
 }
 
 function streamFailure(body: Record<string, unknown>, requestId: string | null, status = 200): SiwcProviderError {
-  const response = isRecord(body.response) ? body.response : null;
-  const error = response && isRecord(response.error)
-    ? response.error
-    : isRecord(body.error) ? body.error : null;
-  const code = safeCode(error?.code) ?? safeCode(body.code);
+  const { code, param } = errorDetails(body);
   const message = code === "subscription_sharing_usage_limit_exceeded"
     ? `ChatGPT plan usage limit reached. Pause plan requests and manage usage at ${SIWC_USAGE_URL}; no API-key fallback was used.`
     : code === "subscription_sharing_usage_unavailable"
       ? `ChatGPT plan usage availability could not be checked; preserve the account and retry later at ${SIWC_USAGE_URL}. No API-key fallback was used.`
       : code === "subscription_sharing_user_not_eligible"
         ? "ChatGPT plan usage is unavailable for this account or workspace; no API-key fallback was used."
-        : `SIWC Responses stream ended with ${body.type === "response.incomplete" ? "response.incomplete" : "a provider error"}${code ? ` (${code})` : ""}; no API-key fallback was used.`;
-  return new SiwcProviderError({ message, status, code, requestId });
+        : code === "unsupported_parameter" || code === "unsupported_capability" || code === "unsupported_value"
+          ? `OpenAI rejected an unsupported Responses field or capability${param ? ` (${param})` : ""}; remove or revise it, or choose a compatible model. No API-key fallback was used.`
+          : `SIWC Responses stream ended with ${body.type === "response.incomplete" ? "response.incomplete" : "a provider error"}${code ? ` (${code})` : ""}${param ? ` for parameter ${param}` : ""}; no API-key fallback was used.`;
+  return new SiwcProviderError({ message, status, code, param, requestId });
 }
 
 type ParsedEvent = Readonly<{ type: string; body: Record<string, unknown> }>;
@@ -163,6 +197,7 @@ async function consumeCompletedStream(response: Response, fetchRequestId: string
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let pendingCarriageReturn = false;
   let output = "";
   let sawDelta = false;
   let completed = false;
@@ -185,11 +220,23 @@ async function consumeCompletedStream(response: Response, fetchRequestId: string
       throw streamFailure(event.body, fetchRequestId, response.status);
     }
   };
+  const appendDecodedText = (decoded: string) => {
+    if (pendingCarriageReturn) {
+      if (decoded.length === 0) return;
+      buffer += "\n";
+      if (decoded.startsWith("\n")) decoded = decoded.slice(1);
+      pendingCarriageReturn = false;
+    }
+    const endsWithCarriageReturn = decoded.endsWith("\r");
+    if (endsWithCarriageReturn) decoded = decoded.slice(0, -1);
+    buffer += decoded.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (endsWithCarriageReturn) pendingCarriageReturn = true;
+  };
   try {
     while (!completed) {
       const { value, done } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      appendDecodedText(decoder.decode(value, { stream: true }));
       while (true) {
         const separator = buffer.indexOf("\n\n");
         if (separator < 0) break;
@@ -200,7 +247,11 @@ async function consumeCompletedStream(response: Response, fetchRequestId: string
       }
     }
     if (!completed) {
-      buffer += decoder.decode();
+      appendDecodedText(decoder.decode());
+      if (pendingCarriageReturn) {
+        buffer += "\n";
+        pendingCarriageReturn = false;
+      }
       if (buffer.trim()) consumeBlock(buffer);
     }
   } catch (error) {
@@ -244,11 +295,12 @@ export async function listSiwcModels(
   }
   if (!response.ok) {
     const body = await safeResponseBody(response);
-    const code = errorCode(body.parsed);
+    const { code, param } = errorDetails(body.parsed);
     throw new SiwcProviderError({
-      message: messageForStatus(response.status, code),
+      message: messageForStatus(response.status, code, param),
       status: response.status,
       code,
+      param,
       requestId: safeRequestId(response.headers),
       bodyShape: body.shape,
     });
@@ -276,9 +328,8 @@ export function createSiwcResponsesProvider(options: SiwcResponsesProviderOption
       let accessToken: string;
       try {
         accessToken = await options.getAccessToken();
-      } catch (error) {
-        if (error instanceof Error) throw error;
-        throw new SiwcProviderError({ message: "无法取得所选 SIWC 账户的授权；未发起推理。" });
+      } catch {
+        throw new SiwcProviderError({ message: "无法取得所选 SIWC 账户的授权；请检查本机账户状态或重新登录。未发起推理，也未输出凭据。" });
       }
       if (!accessToken) throw new SiwcProviderError({ message: "所选 SIWC 账户没有有效 access token；未发起推理。" });
       let response: Response;
@@ -300,11 +351,12 @@ export function createSiwcResponsesProvider(options: SiwcResponsesProviderOption
       const requestId = safeRequestId(response.headers);
       if (!response.ok) {
         const body = await safeResponseBody(response);
-        const code = errorCode(body.parsed);
+        const { code, param } = errorDetails(body.parsed);
         throw new SiwcProviderError({
-          message: messageForStatus(response.status, code),
+          message: messageForStatus(response.status, code, param),
           status: response.status,
           code,
+          param,
           requestId,
           bodyShape: body.shape,
         });
