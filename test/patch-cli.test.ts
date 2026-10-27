@@ -4,7 +4,7 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { parsePatchArguments, runPatchCli } from "../src/patch-cli.js";
+import { parsePatchArguments, renderDiffForTerminal, runPatchCli } from "../src/patch-cli.js";
 
 type Fixture = Readonly<{ root: string; outsideFile: string; commandMarkers: readonly string[] }>;
 
@@ -103,9 +103,11 @@ async function withDirtyRepository<T>(callback: (fixture: Fixture) => Promise<T>
 }
 
 async function originState(root: string): Promise<Readonly<Record<string, string>>> {
+  const indexPath = path.resolve(root, git(root, "rev-parse", "--git-path", "index").toString("utf8").trim());
   return {
     head: git(root, "rev-parse", "HEAD").toString("utf8").trim(),
     branch: git(root, "rev-parse", "--abbrev-ref", "HEAD").toString("utf8").trim(),
+    index: (await readFile(indexPath)).toString("hex"),
     status: git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").toString("hex"),
     stagedDiff: git(root, "diff", "--cached", "--binary", "HEAD").toString("hex"),
     unstagedDiff: git(root, "diff", "--binary").toString("hex"),
@@ -176,6 +178,16 @@ function keptWorktreePath(output: string): string {
   assert.ok(match, "keep flow should report the exact isolated worktree path");
   return match[1] as string;
 }
+
+test("diff renderer preserves LF boundaries and escapes terminal controls", () => {
+  const rawDiff = "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n+fake\u001b]8;;https://bad.example\u0007link\u0007\r\t\u009b31m\u2028\u202e\nnext line\n";
+  const rendered = renderDiffForTerminal(rawDiff);
+
+  assert.equal(rendered.split("\n").length, rawDiff.split("\n").length);
+  assert.ok(rendered.includes("\n--- a/file.ts\n+++ b/file.ts\n"));
+  assert.ok(rendered.includes("+fake\\x1b]8;;https://bad.example\\x07link\\x07\\x0d\\x09\\x9b31m\\u2028\\u202e\nnext line\n"));
+  assert.doesNotMatch(rendered, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028-\u2029\u202a-\u202e\u2066-\u2069]/);
+});
 
 test("patch CLI requires an explicit plan and exact safe repository-relative file list", () => {
   assert.deepEqual(parsePatchArguments(["--plan", "Fix greeting", "--file", "src/main.ts"]), {
@@ -251,7 +263,7 @@ test("declining the exact plan and file scope creates no worktree and sends no r
 });
 
 test("approved patch preview is the exact mock request, diff equals kept worktree, and origin worktree is unchanged", async () => {
-  await withDirtyRepository(async ({ root }) => {
+  await withDirtyRepository(async ({ root, commandMarkers }) => {
     const before = await originState(root);
     const output = captureOutput();
     const mock = commonOptions(root, output, patchContent(), "keep");
@@ -266,6 +278,8 @@ test("approved patch preview is the exact mock request, diff equals kept worktre
     assert.match(output.text, /src\/main\.ts/);
     assert.doesNotMatch(mock.sentBody, /never-include-this|user unstaged change|User staged change|Untracked local note|Baseline README/);
     assert.match(output.text, /候选补丁在隔离工作树中相对基准 HEAD 的完整 diff/);
+    assert.match(output.text, /\n--- a\/src\/main\.ts\n\+\+\+ b\/src\/main\.ts\n/);
+    assert.match(output.text, /\n-  return "before";\n\+  return "after";\n/);
     assert.match(output.text, /-  return "before";/);
     assert.match(output.text, /\+  return "after";/);
     assert.match(output.text, /引用：src\/main\.ts:1-3/);
@@ -281,6 +295,13 @@ test("approved patch preview is the exact mock request, diff equals kept worktre
     assert.ok(output.text.includes(exactDiff), "displayed diff must exactly match git diff in the kept worktree");
     assert.equal((await readFile(path.join(worktree, "src", "main.ts"), "utf8")).includes('return "after";'), true);
     assert.deepEqual(await originState(root), before);
+    for (const marker of commandMarkers) {
+      await assert.rejects(
+        readFile(marker),
+        (error: unknown) => error instanceof Error && "code" in error && error.code === "ENOENT",
+        `successful keep path must not run a Git hook or filter: ${marker}`,
+      );
+    }
   });
 });
 
