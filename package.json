@@ -9,6 +9,7 @@
     "start": "tsx src/index.ts",
     "inspect": "tsx src/cli.ts",
     "patch": "tsx src/patch.ts",
+    "tui": "tsx src/tui.ts",
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts"
   },

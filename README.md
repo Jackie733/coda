@@ -43,6 +43,14 @@ npm run dev
 
 CLI 从当前目录识别 Git 仓库，显示仓库路径、分支和工作树是否有改动，然后只从 Git 已跟踪的常见源码目录、测试目录和根目录说明/清单中挑选有限上下文。上下文收集不递归扫描整个工作区，也不读取未跟踪文件内容、shell 历史或 `.env`；Git 状态摘要只用于判断是否有改动，不显示未跟踪路径名。它也不把本地仓库路径或认证密钥放进模型 payload。为识别仓库和工作树状态，它只运行固定的只读 Git 元数据/路径查询；不会运行仓库脚本或模型建议的命令。
 
+## Fake-provider TUI（本地状态机演示）
+
+```bash
+npm run tui
+```
+
+该终端界面只演示 #8 的 provider-neutral 状态机：`I` 进入只读流程，`P` 进入补丁流程；patch 必须先明确批准精确文件范围，再在请求预览中再次批准。`Esc`/`N`/返回键取消当前流程，补丁 diff 需先显示后才能选择保留或丢弃。默认 fake provider 只在本地返回固定模拟结果，不联网、不读取真实仓库上下文，也不会写入文件；`TERM=dumb` 使用纯文本输入，非 TTY 会立即安全退出。这个演示不会替代 `inspect` 或 `patch` 的真实工具流程。
+
 ```bash
 export OPENAI_API_KEY='your-api-key'
 # 可选：OPENAI_BASE_URL（默认 https://api.openai.com/v1）和 OPENAI_MODEL（默认 gpt-4.1-mini）
