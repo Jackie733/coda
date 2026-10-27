@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
-import { lstat, mkdtemp, open, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdtemp, open, readFile, realpath, rm, rmdir } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import os from "node:os";
@@ -120,6 +120,15 @@ type ValidatedPatch = Readonly<{ path: string; edits: readonly FileEdit[] }>;
 
 type OriginalFile = Readonly<{ content: string; lineCount: number }>;
 
+type CleanupOperations = Readonly<{
+  removeWorktree?: (repositoryRoot: string, worktreePath: string, disabledFilters: readonly string[]) => Promise<void>;
+  removeParentDirectory?: (parentDirectory: string) => Promise<void>;
+}>;
+
+type CleanupResult =
+  | Readonly<{ complete: true }>
+  | Readonly<{ complete: false; phase: "worktree" | "parent"; residualPath: string; error: string }>;
+
 type PatchCliOptions = Readonly<{
   cwd?: string;
   plan?: string;
@@ -129,6 +138,7 @@ type PatchCliOptions = Readonly<{
   approvePlan?: () => Promise<boolean>;
   confirmSend?: () => Promise<boolean>;
   chooseDisposition?: () => Promise<Disposition | null>;
+  cleanupOperations?: CleanupOperations;
   stdout?: Writer;
   stdin?: Reader;
 }>;
@@ -139,6 +149,27 @@ function output(writer: Writer, text: string): void {
 
 function errorMessage(error: unknown): string {
   return visibleControls(error instanceof Error ? error.message : "未知错误");
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+async function existingPathOrFallback(paths: readonly string[], fallback: string): Promise<string> {
+  for (const candidate of paths) {
+    try {
+      await lstat(candidate);
+      return candidate;
+    } catch (error) {
+      if (!isMissingPathError(error)) return candidate;
+    }
+  }
+  return fallback;
+}
+
+function quoteRecoveryPath(value: string): string {
+  if (process.platform === "win32") return `'${value.replaceAll("'", "''")}'`;
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -274,10 +305,12 @@ async function initializeOwnedWorktree(owned: OwnedWorktree, approvedFiles: read
   }
 }
 
-async function discardOwnedWorktree(owned: OwnedWorktree): Promise<{ remains: boolean; error?: string }> {
+async function discardOwnedWorktree(owned: OwnedWorktree, operations: CleanupOperations = {}): Promise<CleanupResult> {
+  let canonicalParent: string;
+  let canonicalWorktree: string;
   try {
-    const canonicalParent = await realpath(owned.parentDirectory);
-    const canonicalWorktree = await realpath(owned.worktreePath);
+    canonicalParent = await realpath(owned.parentDirectory);
+    canonicalWorktree = await realpath(owned.worktreePath);
     if (
       canonicalWorktree !== owned.worktreePath ||
       path.dirname(canonicalWorktree) !== canonicalParent ||
@@ -291,29 +324,113 @@ async function discardOwnedWorktree(owned: OwnedWorktree): Promise<{ remains: bo
     if (!listing.split("\n").includes(`worktree ${canonicalWorktree}`)) {
       throw new Error("Git 未将该目录登记为本任务创建的工作树；未删除。");
     }
-    await runGit(["worktree", "remove", "--force", canonicalWorktree], owned.repositoryRoot, 256 * 1024, owned.disabledFilters);
-    await rm(canonicalParent, { recursive: true, force: true }).catch(() => undefined);
-    return { remains: false };
   } catch (error) {
-    let remains = false;
-    try {
-      await lstat(owned.worktreePath);
-      remains = true;
-    } catch {
-      remains = false;
-      await rm(owned.parentDirectory, { recursive: true, force: true }).catch(() => undefined);
-    }
-    return { remains, error: errorMessage(error) };
+    return {
+      complete: false,
+      phase: "worktree",
+      residualPath: await existingPathOrFallback([owned.worktreePath, owned.parentDirectory], owned.worktreePath),
+      error: errorMessage(error),
+    };
   }
+
+  const removeWorktree = operations.removeWorktree ?? (async (
+    repositoryRoot: string,
+    worktreePath: string,
+    disabledFilters: readonly string[],
+  ) => {
+    await runGit(["worktree", "remove", "--force", worktreePath], repositoryRoot, 256 * 1024, disabledFilters);
+  });
+  try {
+    await removeWorktree(owned.repositoryRoot, canonicalWorktree, owned.disabledFilters);
+  } catch (error) {
+    return {
+      complete: false,
+      phase: "worktree",
+      residualPath: await existingPathOrFallback([canonicalWorktree, canonicalParent], canonicalWorktree),
+      error: errorMessage(error),
+    };
+  }
+
+  try {
+    await lstat(canonicalWorktree);
+    return {
+      complete: false,
+      phase: "worktree",
+      residualPath: canonicalWorktree,
+      error: "Git 的移除命令返回成功，但隔离工作树目录仍存在。",
+    };
+  } catch (error) {
+    if (!isMissingPathError(error)) {
+      return { complete: false, phase: "worktree", residualPath: canonicalWorktree, error: errorMessage(error) };
+    }
+  }
+
+  let remainingWorktrees: string;
+  try {
+    remainingWorktrees = await runGit(["worktree", "list", "--porcelain"], owned.repositoryRoot, 256 * 1024, owned.disabledFilters);
+  } catch (error) {
+    return {
+      complete: false,
+      phase: "worktree",
+      residualPath: await existingPathOrFallback([canonicalParent], canonicalWorktree),
+      error: errorMessage(error),
+    };
+  }
+  if (remainingWorktrees.split("\n").includes(`worktree ${canonicalWorktree}`)) {
+    return {
+      complete: false,
+      phase: "worktree",
+      residualPath: await existingPathOrFallback([canonicalParent], canonicalWorktree),
+      error: "隔离工作树目录已不存在，但 Git 仍登记了该工作树。",
+    };
+  }
+
+  const removeParentDirectory = operations.removeParentDirectory ?? (async (parentDirectory: string) => {
+    await rmdir(parentDirectory);
+  });
+  try {
+    await removeParentDirectory(canonicalParent);
+  } catch (error) {
+    if (isMissingPathError(error)) return { complete: true };
+    return {
+      complete: false,
+      phase: "parent",
+      residualPath: await existingPathOrFallback([canonicalParent], canonicalParent),
+      error: errorMessage(error),
+    };
+  }
+
+  try {
+    await lstat(canonicalParent);
+    return {
+      complete: false,
+      phase: "parent",
+      residualPath: canonicalParent,
+      error: "目录移除操作返回成功，但临时父目录仍存在。",
+    };
+  } catch (error) {
+    if (!isMissingPathError(error)) {
+      return { complete: false, phase: "parent", residualPath: canonicalParent, error: errorMessage(error) };
+    }
+  }
+  return { complete: true };
 }
 
-function reportWorktreeState(writer: Writer, remains: boolean, worktreePath: string, label: string): void {
-  if (remains) {
-    output(writer, `隔离工作树状态：仍保留，可检查后手动处理：${visibleControls(worktreePath)}\n`);
+function reportWorktreeState(writer: Writer, cleanup: CleanupResult, owned: OwnedWorktree, label: string): void {
+  if (cleanup.complete) {
+    output(writer, `隔离工作树状态：${label}；工作树与临时父目录均已移除。\n`);
+  } else if (cleanup.phase === "worktree") {
+    output(writer, `清理未完成：未能确认隔离工作树已移除；请核对路径：${visibleControls(cleanup.residualPath)}\n`);
+    output(writer, `清理说明：${visibleControls(cleanup.error)}\n`);
+    const recoveryInstruction = `安全恢复：先用 git -C ${quoteRecoveryPath(owned.repositoryRoot)} worktree list --porcelain 核对该路径；确认是本任务临时工作树后，重试 git -C ${quoteRecoveryPath(owned.repositoryRoot)} worktree remove --force ${quoteRecoveryPath(owned.worktreePath)}，再仅对空父目录执行 rmdir ${quoteRecoveryPath(owned.parentDirectory)}。不要递归删除或改动其他工作树。`;
+    output(writer, `${visibleControls(recoveryInstruction)}\n`);
   } else {
-    output(writer, `隔离工作树状态：${label}；不存在可保留的隔离工作树。\n`);
+    output(writer, `隔离工作树已移除，但临时父目录未能清理；残留路径：${visibleControls(cleanup.residualPath)}\n`);
+    output(writer, `清理说明：${visibleControls(cleanup.error)}\n`);
+    const recoveryInstruction = `安全恢复：只对上述空的任务临时父目录重试 rmdir ${quoteRecoveryPath(owned.parentDirectory)}；不要使用递归删除。`;
+    output(writer, `${visibleControls(recoveryInstruction)}\n`);
   }
-  output(writer, "源工作树文件、索引和未提交状态未被更改；Git 只维护隔离 linked-worktree 的管理元数据。不会执行模型生成或用户计划中的命令、提交、推送或创建 PR。\n");
+  output(writer, "源工作树文件、索引和未提交状态未被更改；Git 仅维护本任务隔离 linked-worktree 的管理元数据。不会执行用户计划中的命令、提交、推送或创建 PR。\n");
 }
 
 function lineCount(text: string): number {
@@ -773,21 +890,17 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
         : await interactiveConsent(options.stdin ?? process.stdin, stdout);
     } catch (error) {
       output(stdout, `未发送：无法取得确认（${errorMessage(error)}）。\n`);
-      const pathToReport = owned.worktreePath;
-      const cleanup = await discardOwnedWorktree(owned);
+      const cleanup = await discardOwnedWorktree(owned, options.cleanupOperations);
+      reportWorktreeState(stdout, cleanup, owned, "已清理");
       owned = null;
-      reportWorktreeState(stdout, cleanup.remains, pathToReport, "已清理");
-      if (cleanup.error) output(stdout, `清理说明：${cleanup.error}\n`);
       return 1;
     }
     if (!approved) {
       output(stdout, "已取消：未发送模型请求，也未应用补丁。\n");
-      const pathToReport = owned.worktreePath;
-      const cleanup = await discardOwnedWorktree(owned);
+      const cleanup = await discardOwnedWorktree(owned, options.cleanupOperations);
+      reportWorktreeState(stdout, cleanup, owned, "已丢弃");
       owned = null;
-      reportWorktreeState(stdout, cleanup.remains, pathToReport, "已丢弃");
-      if (cleanup.error) output(stdout, `清理说明：${cleanup.error}\n`);
-      return 0;
+      return cleanup.complete ? 0 : 1;
     }
 
     const apiKey = env.OPENAI_API_KEY;
@@ -850,11 +963,9 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
         : await interactiveDisposition(options.stdin ?? process.stdin, stdout);
     } catch (error) {
       output(stdout, `未保留补丁：无法取得保留/丢弃选择（${errorMessage(error)}）。\n`);
-      const pathToReport = owned.worktreePath;
-      const cleanup = await discardOwnedWorktree(owned);
+      const cleanup = await discardOwnedWorktree(owned, options.cleanupOperations);
+      reportWorktreeState(stdout, cleanup, owned, "已丢弃");
       owned = null;
-      reportWorktreeState(stdout, cleanup.remains, pathToReport, "已丢弃");
-      if (cleanup.error) output(stdout, `清理说明：${cleanup.error}\n`);
       return 1;
     }
 
@@ -869,26 +980,23 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
       return 0;
     }
 
-    const pathToReport = owned.worktreePath;
-    const cleanup = await discardOwnedWorktree(owned);
-    owned = null;
+    const cleanup = await discardOwnedWorktree(owned, options.cleanupOperations);
     if (disposition === null) output(stdout, "保留/丢弃选择已取消或无效；候选补丁未标记为完成。\n");
-    else if (cleanup.remains) output(stdout, "丢弃未完成；候选补丁仍保留在隔离工作树中。\n");
+    else if (!cleanup.complete && cleanup.phase === "worktree") output(stdout, "丢弃未完成；隔离补丁工作树未能确认已移除。\n");
+    else if (!cleanup.complete) output(stdout, "补丁工作树已移除，但临时父目录仍待清理。\n");
     else output(stdout, "已生成后丢弃隔离补丁工作树。\n");
-    reportWorktreeState(stdout, cleanup.remains, pathToReport, cleanup.remains ? "仍保留" : "已丢弃");
-    if (cleanup.error) output(stdout, `清理说明：${cleanup.error}\n`);
-    return disposition === null || cleanup.remains ? 1 : 0;
+    reportWorktreeState(stdout, cleanup, owned, cleanup.complete ? "已丢弃" : "清理未完成");
+    owned = null;
+    return disposition === null || !cleanup.complete ? 1 : 0;
   } catch (error) {
     output(stdout, `补丁流程失败；未声称成功，源工作树文件、索引和已有改动未被更改：${errorMessage(error)}\n`);
     if (!owned) {
       output(stdout, "隔离工作树状态：未创建或已清理。\n");
       return 1;
     }
-    const pathToReport = owned.worktreePath;
-    const cleanup = await discardOwnedWorktree(owned);
+    const cleanup = await discardOwnedWorktree(owned, options.cleanupOperations);
+    reportWorktreeState(stdout, cleanup, owned, cleanup.complete ? "已清理" : "清理未完成");
     owned = null;
-    reportWorktreeState(stdout, cleanup.remains, pathToReport, cleanup.remains ? "仍保留" : "已清理");
-    if (cleanup.error) output(stdout, `清理说明：${cleanup.error}\n`);
     return 1;
   }
 }

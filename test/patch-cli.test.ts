@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readFile, readlink, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readlink, readdir, rm, rmdir, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -463,6 +463,91 @@ test("discard removes generated isolated worktree without changing the source wo
     assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
     const listing = git(root, "worktree", "list", "--porcelain").toString("utf8");
     assert.equal(listing.split("\n").filter((line) => line.startsWith("worktree ")).length, 2);
+  });
+});
+
+test("failed git worktree removal returns non-zero, reports its exact path, and can be retried safely", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
+    const output = captureOutput();
+    const mock = commonOptions(root, output, patchContent(), "discard");
+    let removeAttempts = 0;
+    let attemptedRoot = "";
+    let attemptedWorktree = "";
+    const exitCode = await runPatchCli({
+      ...mock.options,
+      confirmSend: async () => false,
+      cleanupOperations: {
+        removeWorktree: async (repositoryRoot, worktreePath) => {
+          removeAttempts += 1;
+          attemptedRoot = repositoryRoot;
+          attemptedWorktree = worktreePath;
+          throw new Error("injected git worktree remove failure");
+        },
+      },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(mock.fetchCalls, 0);
+    assert.equal(removeAttempts, 1);
+    assert.equal(attemptedRoot, root);
+    assert.equal(path.basename(attemptedWorktree), "worktree");
+    assert.ok(output.text.includes(attemptedWorktree), "the exact leftover worktree path must be reported");
+    assert.match(output.text, /清理未完成：未能确认隔离工作树已移除/);
+    assert.match(output.text, /worktree remove --force/);
+    assert.match(output.text, /rmdir/);
+    assert.match(output.text, /injected git worktree remove failure/);
+    assert.match(output.text, /已取消：未发送模型请求，也未应用补丁/);
+    assert.doesNotMatch(output.text, /隔离工作树状态：已丢弃|已生成后丢弃隔离补丁工作树/);
+    assert.ok((await readFile(path.join(attemptedWorktree, "src", "main.ts"), "utf8")).includes('return "before";'));
+    const listingAfterFailure = git(root, "worktree", "list", "--porcelain").toString("utf8");
+    assert.ok(listingAfterFailure.includes(`worktree ${attemptedWorktree}`));
+    assert.deepEqual(await originState(root), before);
+    assertRegistryEntriesUnchanged(registryBefore, await gitWorktreeRegistryState(root));
+
+    git(root, "worktree", "remove", "--force", attemptedWorktree);
+    await rmdir(path.dirname(attemptedWorktree));
+    assert.deepEqual(await originState(root), before);
+    assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
+  });
+});
+
+test("failed parent-directory removal reports the exact residual directory and can be retried without recursion", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const registryBefore = await gitWorktreeRegistryState(root);
+    const output = captureOutput();
+    const mock = commonOptions(root, output, patchContent(), "discard");
+    let attemptedParent = "";
+    const exitCode = await runPatchCli({
+      ...mock.options,
+      cleanupOperations: {
+        removeParentDirectory: async (parentDirectory) => {
+          attemptedParent = parentDirectory;
+          throw new Error("injected parent-directory removal failure");
+        },
+      },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(mock.fetchCalls, 1);
+    assert.ok(attemptedParent);
+    assert.ok(output.text.includes(attemptedParent), "the exact residual parent path must be reported");
+    assert.match(output.text, /隔离工作树已移除，但临时父目录未能清理/);
+    assert.match(output.text, /rmdir/);
+    assert.match(output.text, /不要使用递归删除/);
+    assert.match(output.text, /injected parent-directory removal failure/);
+    assert.doesNotMatch(output.text, /已生成后丢弃隔离补丁工作树/);
+    assert.deepEqual(await readdir(attemptedParent), [], "only an empty task-owned parent directory should remain");
+    const listingAfterFailure = git(root, "worktree", "list", "--porcelain").toString("utf8");
+    assert.ok(!listingAfterFailure.includes(`worktree ${path.join(attemptedParent, "worktree")}`));
+    assert.deepEqual(await originState(root), before);
+    assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
+
+    await rmdir(attemptedParent);
+    assert.deepEqual(await originState(root), before);
+    assert.deepEqual(await gitWorktreeRegistryState(root), registryBefore);
   });
 });
 
