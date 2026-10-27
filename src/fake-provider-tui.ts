@@ -3,14 +3,17 @@ import type { Readable, Writable } from "node:stream";
 import {
   ApplicationStateMachine,
   approvePatchScope,
+  createApprovedFileScope,
   requestAfterApproval,
   type Provider,
 } from "./application.js";
+import { CONTEXT_LIMITS, isSafeRepositoryPath } from "./repo-context.js";
 import { renderDiffForTerminal } from "./patch-cli.js";
 import { visibleControls } from "./readonly-cli.js";
 
 export type FakeProviderRequest = Readonly<{
   workflow: "inspect" | "patch";
+  task: string;
   plan: string;
   files: readonly string[];
 }>;
@@ -34,9 +37,12 @@ type TuiOutput = Writable & {
 type TuiAction =
   | "enter" | "cancel" | "back" | "up" | "down"
   | "inspect" | "patch" | "approve" | "keep" | "discard" | "restart" | "quit"
-  | "invalid";
+  | "editTask" | "editPlan" | "editFiles" | "invalid";
 
 type Keypress = Readonly<{ name?: string; ctrl?: boolean }>;
+type TerminalEvent =
+  | Readonly<{ kind: "keypress"; text: string; key: Keypress }>
+  | Readonly<{ kind: "line"; text: string }>;
 type TerminalMode = "raw" | "line";
 type WorkflowRunResult =
   | Readonly<{ kind: "menu" }>
@@ -50,9 +56,12 @@ type FakeProviderTuiOptions = Readonly<{
   provider?: FakeProvider;
 }>;
 
-const DEMO_PLAN = "演示由状态机控制的请求审批与结果展示；不会修改文件。";
-const DEMO_FILES = Object.freeze(["src/app.ts"]);
-const DEFAULT_DIFF = "--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1 @@\n-export const demo = false;\n+export const demo = true;\n";
+const MAX_TASK_CHARS = 2_000;
+const MAX_PLAN_CHARS = 2_000;
+const MAX_FILES = CONTEXT_LIMITS.maxFiles;
+const MAX_FILE_LIST_CHARS = MAX_FILES * 1_024 + (MAX_FILES - 1) * 2;
+const SAFE_GIT_PATH_SEGMENT = /^[A-Za-z0-9._+@-]+$/;
+const DISALLOWED_INPUT_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
 
 function defaultFakeProvider(): FakeProvider {
   return Object.freeze({
@@ -60,10 +69,14 @@ function defaultFakeProvider(): FakeProvider {
       if (request.workflow === "inspect") {
         return Object.freeze({
           workflow: "inspect",
-          summary: "这是本地 fake-provider 的模拟回复。未访问网络，也未读取或修改仓库文件。",
+          summary: `这是本地 fake-provider 对任务“${request.task}”的模拟回复。未访问网络，也未读取或修改仓库文件。`,
         });
       }
-      return Object.freeze({ workflow: "patch", diff: DEFAULT_DIFF });
+      const file = request.files[0] ?? "synthetic/demo.ts";
+      return Object.freeze({
+        workflow: "patch",
+        diff: `--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n-export const demo = false;\n+export const demo = true;\n`,
+      });
     },
   });
 }
@@ -135,8 +148,10 @@ function actionFromKeypress(key: Keypress): TuiAction {
     case "k": return "keep";
     case "d": return "discard";
     case "c": return "cancel";
-    case "p": return "patch";
     case "b": return "back";
+    case "t": return "editTask";
+    case "2": return "editPlan";
+    case "f": return "editFiles";
     case "r": return "restart";
     case "q": return "quit";
     default: return "invalid";
@@ -154,6 +169,9 @@ function actionFromLine(line: string): TuiAction {
   if (value === "p" || value === "patch") return "patch";
   if (value === "k" || value === "keep") return "keep";
   if (value === "d" || value === "discard") return "discard";
+  if (value === "t" || value === "task") return "editTask";
+  if (value === "2" || value === "plan") return "editPlan";
+  if (value === "f" || value === "files") return "editFiles";
   if (value === "r" || value === "restart") return "restart";
   if (value === "q" || value === "quit") return "quit";
   return "invalid";
@@ -166,9 +184,9 @@ class TuiTerminal {
   readonly #readline: ReadlineInterface | null;
   #screen = "";
   #prompt = "";
-  #pendingRaw: ((action: TuiAction | null) => void) | null = null;
-  #pendingLine: ((action: TuiAction | null) => void) | null = null;
-  #rawQueue: TuiAction[] = [];
+  #pendingRaw: ((event: TerminalEvent | null) => void) | null = null;
+  #pendingLine: ((event: TerminalEvent | null) => void) | null = null;
+  #rawQueue: TerminalEvent[] = [];
   #closed = false;
   readonly #keypressHandler: (text: string, key: Keypress) => void;
   readonly #endHandler: () => void;
@@ -180,11 +198,11 @@ class TuiTerminal {
     this.#input = input;
     this.#output = output;
     this.mode = term?.toLowerCase() === "dumb" || typeof input.setRawMode !== "function" ? "line" : "raw";
-    this.#keypressHandler = (_text, key) => this.#dispatchRaw(actionFromKeypress(key));
+    this.#keypressHandler = (text, key) => this.#dispatchRaw({ kind: "keypress", text, key });
     this.#endHandler = () => this.#closeInput();
     this.#resizeHandler = () => this.#draw();
     this.#lineCloseHandler = () => this.#closeInput();
-    this.#lineSigintHandler = () => this.#dispatchLine("cancel");
+    this.#lineSigintHandler = () => this.#dispatchLine({ kind: "keypress", text: "", key: { name: "escape" } });
 
     if (this.mode === "raw") {
       emitKeypressEvents(input);
@@ -209,7 +227,7 @@ class TuiTerminal {
     this.#draw();
   }
 
-  async readAction(): Promise<TuiAction | null> {
+  async readEvent(): Promise<TerminalEvent | null> {
     if (this.#closed) return null;
     if (this.mode === "raw") {
       const queued = this.#rawQueue.shift();
@@ -221,11 +239,63 @@ class TuiTerminal {
     return new Promise((resolve) => {
       this.#pendingLine = resolve;
       try {
-        readline.question("> ", (answer) => this.#dispatchLine(actionFromLine(answer)));
+        readline.question("> ", (answer) => this.#dispatchLine({ kind: "line", text: answer }));
       } catch {
         this.#dispatchLine(null);
       }
     });
+  }
+
+  async readAction(): Promise<TuiAction | null> {
+    const event = await this.readEvent();
+    if (!event) return null;
+    return event.kind === "line" ? actionFromLine(event.text) : actionFromKeypress(event.key);
+  }
+
+  async readText(screen: string, label: string, prompt: string, initial: string, maxChars: number): Promise<string | null> {
+    const characters = Array.from(initial);
+    let cursor = characters.length;
+    let notice = "";
+    while (true) {
+      const shown = `${characters.slice(0, cursor).join("")}|${characters.slice(cursor).join("")}`;
+      const lines = [screen, "", `${label}：${visibleControls(shown)}`];
+      if (notice) lines.push("", notice);
+      this.show(lines.join("\n"), prompt);
+
+      const event = await this.readEvent();
+      if (!event) return null;
+      if (event.kind === "line") {
+        if (event.text.trim().toLowerCase() === ":cancel") return null;
+        return event.text;
+      }
+      const { key, text } = event;
+      if ((key.ctrl && key.name === "c") || key.name === "escape") return null;
+      if (key.name === "return" || key.name === "enter") return characters.join("");
+      if (key.name === "backspace") {
+        if (cursor > 0) { characters.splice(cursor - 1, 1); cursor -= 1; }
+        notice = "";
+        continue;
+      }
+      if (key.name === "delete") {
+        if (cursor < characters.length) characters.splice(cursor, 1);
+        notice = "";
+        continue;
+      }
+      if (key.name === "left") { cursor = Math.max(0, cursor - 1); continue; }
+      if (key.name === "right") { cursor = Math.min(characters.length, cursor + 1); continue; }
+      if (key.name === "home" || (key.ctrl && key.name === "a")) { cursor = 0; continue; }
+      if (key.name === "end" || (key.ctrl && key.name === "e")) { cursor = characters.length; continue; }
+      if (key.ctrl && key.name === "u") { characters.splice(0); cursor = 0; notice = ""; continue; }
+      if (!text || DISALLOWED_INPUT_CONTROLS.test(text)) continue;
+      const insertion = Array.from(text);
+      if (characters.length + insertion.length > maxChars) {
+        notice = `最多输入 ${maxChars} 个字符。`;
+        continue;
+      }
+      characters.splice(cursor, 0, ...insertion);
+      cursor += insertion.length;
+      notice = "";
+    }
   }
 
   close(): void {
@@ -253,21 +323,21 @@ class TuiTerminal {
     else this.#output.write(`\n${content}`);
   }
 
-  #dispatchRaw(action: TuiAction): void {
+  #dispatchRaw(event: TerminalEvent | null): void {
     if (this.#pendingRaw) {
       const resolve = this.#pendingRaw;
       this.#pendingRaw = null;
-      resolve(action);
-    } else if (!this.#closed) {
-      this.#rawQueue.push(action);
+      resolve(event);
+    } else if (event && !this.#closed) {
+      this.#rawQueue.push(event);
     }
   }
 
-  #dispatchLine(action: TuiAction | null): void {
+  #dispatchLine(event: TerminalEvent | null): void {
     if (!this.#pendingLine) return;
     const resolve = this.#pendingLine;
     this.#pendingLine = null;
-    resolve(action);
+    resolve(event);
   }
 
   #closeInput(): void {
@@ -311,6 +381,19 @@ function requestPreview(request: FakeProviderRequest): string {
     JSON.stringify(request, null, 2),
     "",
     "只有在此处明确批准后才会调用 fake provider；取消不会发出 provider 请求。",
+  ].join("\n");
+}
+
+function scopeReviewScreen(request: FakeProviderRequest): string {
+  return [
+    "补丁计划与精确文件范围复核",
+    "",
+    `任务：${visibleControls(request.task)}`,
+    `计划：${visibleControls(request.plan)}`,
+    "批准的仓库相对路径：",
+    ...request.files.map((file) => `  - ${visibleControls(file)}`),
+    "",
+    "可编辑任务、计划或文件范围；确认后仍需在完整请求预览中再次批准。",
   ].join("\n");
 }
 
@@ -359,32 +442,158 @@ async function recoveryChoice(terminal: TuiTerminal, message: string): Promise<"
   }
 }
 
-async function runWorkflow(terminal: TuiTerminal, kind: "inspect" | "patch", provider: FakeProvider): Promise<WorkflowRunResult> {
-  const workflow = new ApplicationStateMachine(kind);
-  const request: FakeProviderRequest = Object.freeze({
-    workflow: kind,
-    plan: DEMO_PLAN,
-    files: kind === "patch" ? DEMO_FILES : Object.freeze([]),
-  });
+async function editRequiredText(
+  terminal: TuiTerminal,
+  label: string,
+  description: string,
+  initial: string,
+  maxChars: number,
+): Promise<string | null> {
+  let current = initial;
+  let issue = "";
+  while (true) {
+    const screen = [description, issue].filter(Boolean).join("\n\n");
+    const prompt = terminal.mode === "line"
+      ? "输入完整字段；Enter 保存；输入 :cancel 取消本次编辑。"
+      : "直接输入；Backspace/方向键可编辑；Enter 保存；Esc 取消本次编辑。";
+    const value = await terminal.readText(screen, label, prompt, current, maxChars);
+    if (value === null) return null;
+    if (!value.trim()) {
+      current = value;
+      issue = "此项不能为空，请输入内容后按 Enter。";
+      continue;
+    }
+    if (value.length > maxChars) {
+      current = value;
+      issue = `此项最多 ${maxChars} 个字符。`;
+      continue;
+    }
+    if (DISALLOWED_INPUT_CONTROLS.test(value)) {
+      current = value.replace(DISALLOWED_INPUT_CONTROLS, "");
+      issue = "输入不能包含终端控制或方向格式字符。";
+      continue;
+    }
+    return value.trim();
+  }
+}
 
+function parseFileRange(value: string): readonly string[] {
+  const rawFiles = value.split(",");
+  if (!value.trim() || rawFiles.length === 0 || rawFiles.length > MAX_FILES) {
+    throw new Error(`请输入 1–${MAX_FILES} 个精确文件路径，以逗号分隔。`);
+  }
+  const files = rawFiles.map((file) => file.trim());
+  if (files.some((file) => !file)) throw new Error("文件范围不能包含空路径；请检查逗号分隔。 ");
+  for (const file of files) {
+    if (
+      Buffer.byteLength(file, "utf8") > 1_024 ||
+      !isSafeRepositoryPath(file) ||
+      file.split("/").some((segment) => segment.length > 255 || !SAFE_GIT_PATH_SEGMENT.test(segment))
+    ) {
+      throw new Error(`不安全或不支持的仓库相对路径：${visibleControls(file)}`);
+    }
+  }
+  try {
+    return createApprovedFileScope(files).files;
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "文件范围无效。");
+  }
+}
+
+async function editFileRange(
+  terminal: TuiTerminal,
+  initial: readonly string[],
+): Promise<readonly string[] | null> {
+  let current = initial.join(", ");
+  let issue = "";
+  while (true) {
+    const screen = [
+      "输入合成演示仓库中的精确相对文件路径；不会检查或读取真实文件。",
+      issue,
+    ].filter(Boolean).join("\n\n");
+    const prompt = terminal.mode === "line"
+      ? "以逗号分隔多个路径；Enter 保存；输入 :cancel 取消本次编辑。"
+      : "以逗号分隔多个路径；Enter 保存；Esc 取消本次编辑。";
+    const value = await terminal.readText(screen, "文件范围", prompt, current, MAX_FILE_LIST_CHARS);
+    if (value === null) return null;
+    try {
+      return parseFileRange(value);
+    } catch (error) {
+      current = value;
+      issue = errorMessage(error);
+    }
+  }
+}
+
+function makeRequest(
+  kind: "inspect" | "patch",
+  task: string,
+  plan: string,
+  files: readonly string[],
+): FakeProviderRequest {
+  const exactFiles = kind === "patch" ? createApprovedFileScope(files).files : Object.freeze([]);
+  return Object.freeze({ workflow: kind, task, plan, files: exactFiles });
+}
+
+async function runWorkflow(terminal: TuiTerminal, kind: "inspect" | "patch", provider: FakeProvider): Promise<WorkflowRunResult> {
+  const taskInput = await editRequiredText(
+    terminal,
+    "任务",
+    "请输入本次 fake-provider 演示任务。任务会出现在完整请求预览中。",
+    "",
+    MAX_TASK_CHARS,
+  );
+  if (taskInput === null) return { kind: "menu" };
+  let task: string = taskInput;
+
+  let plan = "";
+  let files: readonly string[] = Object.freeze([]);
+  if (kind === "patch") {
+    const editedPlan = await editRequiredText(
+      terminal,
+      "计划",
+      `请输入具体 patch 计划（最多 ${MAX_PLAN_CHARS} 个字符）。`,
+      "",
+      MAX_PLAN_CHARS,
+    );
+    if (editedPlan === null) return { kind: "menu" };
+    plan = editedPlan;
+    const editedFiles = await editFileRange(terminal, []);
+    if (editedFiles === null) return { kind: "menu" };
+    files = editedFiles;
+  }
+
+  const workflow = new ApplicationStateMachine(kind);
+  let request = makeRequest(kind, task, plan, files);
   if (kind === "patch") {
     let scopeAction: TuiAction | null = null;
     const scopeOutcome = await approvePatchScope(workflow, async () => {
-      const action = await choose(
-        terminal,
-        [
-          "补丁计划与文件范围审批",
-          "",
-          `计划：${DEMO_PLAN}`,
-          `精确文件范围：${DEMO_FILES.join(", ")}`,
-          "",
-          "批准范围只允许继续到请求预览；这一步本身不会发送请求。",
-        ].join("\n"),
-        approvalPrompt(),
-        ["enter", "approve", "cancel", "back", "quit"],
-      );
-      scopeAction = action;
-      return action === "enter" || action === "approve";
+      while (true) {
+        request = makeRequest(kind, task, plan, files);
+        const action = await choose(
+          terminal,
+          scopeReviewScreen(request),
+          "Enter/Y 确认精确范围；T 修改任务；2 修改计划；F 修改文件；N/Esc 取消；Q 退出。",
+          ["enter", "approve", "editTask", "editPlan", "editFiles", "cancel", "back", "quit"],
+        );
+        if (action === "editTask") {
+          const edited = await editRequiredText(terminal, "任务", "修改 patch 任务。", task, MAX_TASK_CHARS);
+          if (edited !== null) task = edited;
+          continue;
+        }
+        if (action === "editPlan") {
+          const edited = await editRequiredText(terminal, "计划", `修改具体 patch 计划（最多 ${MAX_PLAN_CHARS} 个字符）。`, plan, MAX_PLAN_CHARS);
+          if (edited !== null) plan = edited;
+          continue;
+        }
+        if (action === "editFiles") {
+          const edited = await editFileRange(terminal, files);
+          if (edited !== null) files = edited;
+          continue;
+        }
+        scopeAction = action;
+        return action === "enter" || action === "approve";
+      }
     });
     if (scopeOutcome.kind === "approval-failed") return { kind: "recover", message: errorMessage(scopeOutcome.error) };
     if (scopeOutcome.kind === "cancelled") return { kind: scopeAction === "quit" ? "quit" : "menu" };
@@ -441,7 +650,7 @@ async function runWorkflow(terminal: TuiTerminal, kind: "inspect" | "patch", pro
     "",
     renderDiffForTerminal(outcome.response.diff),
     "",
-    "请先检查完整 diff，再选择保留（仅保留演示状态）或丢弃。",
+    "请先检查完整 diff，再选择保留或丢弃（仅保留演示状态）。",
   ].join("\n");
   const disposition = await choose(
     terminal,

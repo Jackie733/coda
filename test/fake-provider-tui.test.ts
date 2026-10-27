@@ -53,27 +53,30 @@ function cellCount(text: string): number {
   }, 0);
 }
 
-test("inspect keyboard flow approves once, completes, and can return to the menu", async () => {
+test("inspect accepts a non-demo task, supports backspace editing, and requires request approval", async () => {
   const fixture = terminalFixture();
   let providerCalls = 0;
+  let received: unknown;
   const run = runFakeProviderTui({
     stdin: fixture.stdin,
     stdout: fixture.stdout,
     env: { TERM: "xterm" },
-    provider: responseProvider(async () => {
+    provider: responseProvider(async (request) => {
       providerCalls += 1;
+      received = request;
       return { workflow: "inspect", summary: "fake result" };
     }),
   });
-  sendKeys(fixture, "iybq");
+  sendKeys(fixture, "ihelo\u007flo\nybq");
   assert.equal(await run, 0);
   assert.equal(providerCalls, 1);
+  assert.deepEqual(received, { workflow: "inspect", task: "hello", plan: "", files: [] });
   assert.match(fixture.getOutput(), /完整请求预览/);
   assert.match(fixture.getOutput(), /只读理解结果 — 已完成/);
   assert.equal(fixture.getRawMode(), false);
 });
 
-test("patch requires scope and request approval before showing the fake diff", async () => {
+test("patch collects and edits task, plan, and exact files before scope confirmation", async () => {
   const fixture = terminalFixture();
   let providerCalls = 0;
   let received: unknown;
@@ -87,22 +90,24 @@ test("patch requires scope and request approval before showing the fake diff", a
       return { workflow: "patch", diff: "--- fake diff\n+++ fake diff\n" };
     }),
   });
-  sendKeys(fixture, "pyykq");
+  sendKeys(fixture, "pInitial patch task\nInitial plan\nsrc/demo.ts\nt updated\n2 revised\nf\u007f\u007ftsx\n\nykq");
   assert.equal(await run, 0);
   assert.equal(providerCalls, 1);
   assert.deepEqual(received, {
     workflow: "patch",
-    plan: "演示由状态机控制的请求审批与结果展示；不会修改文件。",
-    files: ["src/app.ts"],
+    task: "Initial patch task updated",
+    plan: "Initial plan revised",
+    files: ["src/demo.tsx"],
   });
-  assert.match(fixture.getOutput(), /补丁计划与文件范围审批/);
+  assert.match(fixture.getOutput(), /补丁计划与精确文件范围复核/);
+  assert.match(fixture.getOutput(), /src\/demo\.tsx/);
   assert.match(fixture.getOutput(), /完整请求预览/);
   assert.match(fixture.getOutput(), /Fake diff — 未应用到任何文件/);
   assert.match(fixture.getOutput(), /演示状态已保留/);
 });
 
 test("cancel and back during request preview return without a provider request", async (t) => {
-  for (const [name, keys] of [["cancel", "inq"], ["back", "ibq"]] as const) {
+  for (const [name, keys] of [["cancel", "iSummarize alpha\nnq"], ["back", "iSummarize beta\nbq"]] as const) {
     await t.test(name, async () => {
       const fixture = terminalFixture();
       let providerCalls = 0;
@@ -123,6 +128,71 @@ test("cancel and back during request preview return without a provider request",
   }
 });
 
+test("empty task, plan, and file inputs are rejected before the explicit gates", async () => {
+  const fixture = terminalFixture();
+  let providerCalls = 0;
+  let received: unknown;
+  const run = runFakeProviderTui({
+    stdin: fixture.stdin,
+    stdout: fixture.stdout,
+    env: { TERM: "xterm" },
+    provider: responseProvider(async (request) => {
+      providerCalls += 1;
+      received = request;
+      return { workflow: "patch", diff: "--- synthetic diff\n+++ synthetic diff\n" };
+    }),
+  });
+  sendKeys(fixture, "p\nTask from user\n\nPlan from user\n\nsrc/synthetic.ts\n\nykq");
+  assert.equal(await run, 0);
+  assert.equal(providerCalls, 1);
+  assert.deepEqual(received, {
+    workflow: "patch",
+    task: "Task from user",
+    plan: "Plan from user",
+    files: ["src/synthetic.ts"],
+  });
+  assert.match(fixture.getOutput(), /此项不能为空/);
+  assert.match(fixture.getOutput(), /请输入 1–6 个精确文件路径/);
+});
+
+test("canceling task entry or refusing patch scope makes zero provider calls", async (t) => {
+  await t.test("task entry cancellation", async () => {
+    const fixture = terminalFixture();
+    let providerCalls = 0;
+    const run = runFakeProviderTui({
+      stdin: fixture.stdin,
+      stdout: fixture.stdout,
+      env: { TERM: "xterm" },
+      provider: responseProvider(async () => {
+        providerCalls += 1;
+        return { workflow: "inspect", summary: "unexpected" };
+      }),
+    });
+    sendKeys(fixture, "i\u0003q");
+    assert.equal(await run, 0);
+    assert.equal(providerCalls, 0);
+    assert.ok(!fixture.getOutput().includes("完整请求预览（仅发给本地 fake provider）"));
+  });
+  await t.test("patch scope refusal", async () => {
+    const fixture = terminalFixture();
+    let providerCalls = 0;
+    const run = runFakeProviderTui({
+      stdin: fixture.stdin,
+      stdout: fixture.stdout,
+      env: { TERM: "xterm" },
+      provider: responseProvider(async () => {
+        providerCalls += 1;
+        return { workflow: "patch", diff: "unexpected" };
+      }),
+    });
+    sendKeys(fixture, "pTask\nPlan\nsrc/synthetic.ts\nnq");
+    assert.equal(await run, 0);
+    assert.equal(providerCalls, 0);
+    assert.match(fixture.getOutput(), /补丁计划与精确文件范围复核/);
+    assert.ok(!fixture.getOutput().includes("完整请求预览（仅发给本地 fake provider）"));
+  });
+});
+
 test("provider failure is visible and recovery requires a fresh explicit approval", async () => {
   const fixture = terminalFixture();
   let providerCalls = 0;
@@ -137,7 +207,7 @@ test("provider failure is visible and recovery requires a fresh explicit approva
     env: { TERM: "xterm" },
     provider,
   });
-  sendKeys(fixture, "iyriybq");
+  sendKeys(fixture, "iTask one\nyriTask two\nybq");
   assert.equal(await run, 0);
   assert.equal(providerCalls, 2);
   assert.match(fixture.getOutput(), /simulated provider failure/);
@@ -154,7 +224,7 @@ test("diff control characters are rendered as visible text", async () => {
     env: { TERM: "xterm" },
     provider: responseProvider(async () => ({ workflow: "patch", diff: hostileDiff })),
   });
-  sendKeys(fixture, "pyykq");
+  sendKeys(fixture, "pTask for escaping\nSafe synthetic plan\nsrc/demo.ts\n\nyykq");
   assert.equal(await run, 0);
   const output = fixture.getOutput();
   assert.match(output, /\\x1b\[2J/);
@@ -232,6 +302,9 @@ test("CLI completes a keyboard approval flow under a real PTY", { skip: process.
   try {
     await waitFor("选择演示流程");
     child.stdin.write("i");
+    await waitFor("请输入本次 fake-provider 演示任务");
+    child.stdin.write("PTY supplied task");
+    child.stdin.write("\r");
     await waitFor("完整请求预览");
     child.stdin.write("y");
     await waitFor("只读理解结果");
