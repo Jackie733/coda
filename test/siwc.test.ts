@@ -470,6 +470,16 @@ test("identity-only login discloses OAuth data handling before opening authoriza
   });
 });
 
+test("SIWC CLI hides a token-bearing argument from its top-level error output", async () => {
+  const secret = CALLBACK_ACCESS_TOKEN;
+  const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+  const exitCode = await runSiwcCli({ argv: ["login", secret], stdout: output });
+
+  assert.equal(exitCode, 1);
+  assert.match(output.value, /为保护凭据，错误详情已隐藏/);
+  assert.doesNotMatch(output.value, /synthetic-access-token-never-log/);
+});
+
 test("PKCE and dynamic authorization use the official registration contract and exact loopback URI", () => {
   const pkce = createPkceValues();
   assert.ok(pkce.state.length >= 43);
@@ -553,6 +563,27 @@ test("SIWC registration rejects an invalid-state callback, exchanges only the va
       assert.equal((await stat(path.dirname(storePath))).mode & 0o777, 0o700);
     }
   });
+});
+
+test("first dynamic registration rejects missing or invalid issued client IDs before exchange", async () => {
+  const cases = [
+    { omitCallbackClientId: true },
+    { callbackClientId: "not/a-valid-id" },
+  ] as const;
+  for (const scenario of cases) {
+    await withTemporaryStore(async (storePath) => {
+      const mocks = makeAuthorizationMocks({ ...scenario, callbackExpectedStatus: 400 });
+      await assert.rejects(runSiwcAuthorization({
+        storePath,
+        requestPlanUsage: false,
+        fetchImpl: mocks.fetchImpl,
+        openBrowser: mocks.openBrowser,
+        timeoutMs: 2_000,
+      }), /首次 SIWC 注册回调缺少有效签发的 client ID/);
+      assert.equal(mocks.getTokenExchangeCount(), 0);
+      assert.equal((await readSiwcCredentialStore(storePath))?.accounts.length ?? 0, 0);
+    });
+  }
 });
 
 test("valid consent denial stops before token exchange and does not save an account", async () => {
@@ -1413,6 +1444,7 @@ test("a stream without response.completed fails and direct-admission detail text
     { status: 401, requestId: "synthetic-admission-detail-code", detailText: "invalid_grant", expectedDetail: "invalid_grant" },
     { status: 403, requestId: "synthetic-admission-control", detailText: "policy\ndenied", expectedDetail: "policy denied" },
     { status: 403, requestId: "synthetic-admission-bidi", detailText: `safe-before${String.fromCodePoint(0x202e)}spoofed-after${String.fromCodePoint(0x2066)}left${String.fromCodePoint(0x2067)}right${String.fromCodePoint(0x2068)}first${String.fromCodePoint(0x2069)}done`, expectedDetail: "safe-before\\u202Espoofed-after\\u2066left\\u2067right\\u2068first\\u2069done" },
+    { status: 403, requestId: "synthetic-admission-bidi-secret", detailText: `synthetic access${String.fromCodePoint(0x202e)}_token must-not-display`, expectedDetail: null },
     { status: 403, requestId: "synthetic-admission-length", detailText: "diagnostic text ".repeat(30), expectedDetail: `${"diagnostic text ".repeat(30).slice(0, 239)}…` },
   ];
   for (const item of admissionCases) {
@@ -1448,7 +1480,7 @@ test("a stream without response.completed fails and direct-admission detail text
       if (nestedDetail) assert.doesNotMatch(message, /error.code=chatpass_v2_scope_not_authorized|error.param=resource\.invoke/);
       if (item.expectedDetail) assert.ok(message.includes(JSON.stringify(item.expectedDetail)));
       assert.doesNotMatch(message, /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/);
-      assert.doesNotMatch(message, /synthetic-access-token-never-log|synthetic-injected-param-secret|nested private detail/);
+      assert.doesNotMatch(message, /synthetic-access-token-never-log|synthetic-injected-param-secret|nested private detail|must-not-display/);
       return true;
     });
   }

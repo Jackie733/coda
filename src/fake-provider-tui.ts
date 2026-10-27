@@ -10,6 +10,7 @@ import {
 import { CONTEXT_LIMITS, isSafeRepositoryPath } from "./repo-context.js";
 import { renderDiffForTerminal } from "./patch-cli.js";
 import { visibleControls } from "./readonly-cli.js";
+import { safeCliErrorText } from "./safe-cli-error.js";
 import { readSiwcTuiStatus } from "./siwc/ui-status.js";
 
 export type FakeProviderRequest = Readonly<{
@@ -376,7 +377,7 @@ function approvalPrompt(): string {
 }
 
 function errorMessage(error: unknown): string {
-  return visibleControls(error instanceof Error ? error.message : "未知错误");
+  return visibleControls(safeCliErrorText(error, "操作失败；为保护凭据，错误详情已隐藏。"));
 }
 
 function requestPreview(request: FakeProviderRequest): string {

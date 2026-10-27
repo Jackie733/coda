@@ -16,6 +16,7 @@ import {
 } from "./application.js";
 import { createOpenAICompatibleProvider, type ModelRequest } from "./model-provider.js";
 import { endpointFrom, visibleControls } from "./readonly-cli.js";
+import { safeCliErrorText } from "./safe-cli-error.js";
 import { containsLikelySecret, CONTEXT_LIMITS, isSafeRepositoryPath } from "./repo-context.js";
 
 const execFileAsync = promisify(execFile);
@@ -158,7 +159,7 @@ function output(writer: Writer, text: string): void {
 }
 
 function errorMessage(error: unknown): string {
-  return visibleControls(error instanceof Error ? error.message : "未知错误");
+  return visibleControls(safeCliErrorText(error, "补丁流程失败；为保护凭据，错误详情已隐藏。"));
 }
 
 function isMissingPathError(error: unknown): boolean {

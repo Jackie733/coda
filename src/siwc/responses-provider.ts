@@ -83,11 +83,13 @@ function safeDiagnosticDetail(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const normalized = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim();
   if (!normalized || normalized.length > 512) return null;
-  const looksSensitive = /\b(?:bearer|access[_ -]?token|refresh[_ -]?token|id[_ -]?token|api[_ -]?key|client[_ -]?secret|password|authorization[_ -]?code|code[_ -]?verifier)\b/i.test(normalized) ||
-    /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(normalized) ||
-    /\b[A-Za-z0-9_-]{24,}\b/.test(normalized) ||
-    /\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/.test(normalized) ||
-    /https?:\/\/\S+/i.test(normalized);
+  // Treat directional marks as separators for detection, but keep them in the display copy for visible escaping below.
+  const detectionText = normalized.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ");
+  const looksSensitive = /\b(?:bearer|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|api[\s_-]*key|client[\s_-]*secret|password|authorization[\s_-]*code|code[\s_-]*verifier)\b/i.test(detectionText) ||
+    /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(detectionText) ||
+    /\b[A-Za-z0-9_-]{24,}\b/.test(detectionText) ||
+    /\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/.test(detectionText) ||
+    /https?:\/\/\S+/i.test(detectionText);
   if (looksSensitive) return null;
   const visible = escapeBidiControls(normalized);
   return visible.length > 240 ? `${visible.slice(0, 239)}…` : visible;

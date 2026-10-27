@@ -2,10 +2,11 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import { CredentialDurabilityUncertainError, updateSiwcCredentialStore, accountFromStore, planUsageAuthorized, readSiwcCredentialStore, resolveSiwcStorePath, siwcAccountStatuses } from "./siwc/credential-store.js";
-import { isSafeIssuedClientId, runSiwcAuthorization, type AuthorizationOptions } from "./siwc/oauth.js";
+import { isSafeIssuedClientId, runSiwcAuthorization, SiwcAuthorizationError, type AuthorizationOptions } from "./siwc/oauth.js";
 import { getSiwcAccessTokenForUsage, logoutSiwcAccount } from "./siwc/session.js";
 import { createSiwcResponsesProvider, listSiwcModels, SIWC_PLAN_USAGE_NOTICE, SIWC_USAGE_URL, SiwcProviderError } from "./siwc/responses-provider.js";
-import { runReadonlyCli, type ReadonlyCliOptions } from "./readonly-cli.js";
+import { runReadonlyCli, visibleControls, type ReadonlyCliOptions } from "./readonly-cli.js";
+import { safeCliErrorText } from "./safe-cli-error.js";
 
 const USAGE = [
   "Coda SIWC：可选的本机 Sign in with ChatGPT 与计划用量 provider",
@@ -47,9 +48,10 @@ function write(stdout: Writer, text: string): void {
 }
 
 function safeError(error: unknown): string {
-  if (error instanceof SiwcProviderError) return error.toUserMessage();
-  if (error instanceof CredentialDurabilityUncertainError) return error.message;
-  return error instanceof Error ? error.message : "操作未完成；凭据未显示。";
+  if (error instanceof SiwcProviderError) return visibleControls(error.toUserMessage());
+  if (error instanceof CredentialDurabilityUncertainError) return visibleControls(error.message);
+  if (error instanceof SiwcAuthorizationError) return visibleControls(error.message);
+  return visibleControls(safeCliErrorText(error, "操作未完成；为保护凭据，错误详情已隐藏。"));
 }
 
 function valueAfter(args: readonly string[], flag: string): string | undefined {
