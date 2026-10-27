@@ -23,6 +23,7 @@ import {
 import {
   buildSiwcAuthorizationUrl,
   createPkceValues,
+  isSafeIssuedClientId,
   runSiwcAuthorization,
   safeSiwcAuthorizationErrorText,
   SiwcAuthorizationError,
@@ -257,6 +258,10 @@ test("SIWC docs state this project's local-only support and link the official in
     assert.match(document, /填写 \[SIWC interest form\]\(https:\/\/openai\.com\/form\/sign-in-with-chatgpt-interest\/\)/);
     assert.doesNotMatch(document, /必须先取得 OpenAI 要求的批准|任何付费或远程托管版本必须先满足 OpenAI 的 SIWC 审批要求/);
   }
+  const readme = documents[0]!;
+  assert.match(readme, /未命中终端凭据安全筛查时/);
+  assert.match(readme, /若命中筛查，ID 与命令会被隐藏/);
+  assert.match(readme, /只控制终端回显，不改变本次 OAuth token exchange/);
 });
 
 test("SIWC credential storage fails closed when Windows ACL support is unavailable", () => {
@@ -672,6 +677,24 @@ test("OAuth authorization error formatter sanitizes the final message and narrow
     issuedClientId: longIssuedClientId,
   });
   assert.equal(safeSiwcAuthorizationErrorText(clientIdWithMaliciousRequestId, fallback), fallback);
+
+  const secretLikeClientIds = [
+    "sk-proj-syntheticsecret1234567890",
+    "Bearer-secretvalue0123456789abcdef",
+    "api_key_syntheticsecret1234567890",
+    "ghp_syntheticgithubtoken1234567890",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature_12345678",
+    "oaiapp_access_token_syntheticsecret123",
+    "oaiapp_secret_syntheticvalue1234567890",
+  ];
+  for (const issuedClientId of secretLikeClientIds) {
+    assert.equal(isSafeIssuedClientId(issuedClientId), true);
+    const unsafeDisplayError = new SiwcAuthorizationError(`Issued client ID=${issuedClientId}`, {
+      code: "invalid_grant",
+      issuedClientId,
+    });
+    assert.equal(safeSiwcAuthorizationErrorText(unsafeDisplayError, fallback), fallback);
+  }
 });
 
 test("SIWC request-ID validation accepts only the project's current 32-character lowercase-hex req_ shape", () => {
@@ -861,6 +884,44 @@ test("first-registration invalid_grant reauthorizes with the issued client ID an
     assert.notEqual(retry.getTokenBody()?.get("code"), first.getTokenBody()?.get("code"));
     assert.equal(retry.getTokenExchangeCount(), 1);
     assert.equal((await readSiwcCredentialStore(storePath))?.accounts[0]?.clientId, issuedClientId);
+  });
+});
+
+test("first-registration invalid_grant hides credential-like callback client IDs from CLI output", async () => {
+  await withTemporaryStore(async (storePath, root) => {
+    const maliciousClientId = "sk-proj-syntheticsecret1234567890";
+    const oldCode = "synthetic-old-authorization-code";
+    const secretDetail = `synthetic private token detail ${CALLBACK_ACCESS_TOKEN}`;
+    assert.equal(isSafeIssuedClientId(maliciousClientId), true);
+    const mocks = makeAuthorizationMocks({
+      callbackCode: oldCode,
+      callbackClientId: maliciousClientId,
+      tokenError: { code: "invalid_grant", status: 400, description: secretDetail },
+    });
+    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    const exitCode = await runSiwcCli({
+      argv: ["login", "--plan-usage"],
+      env: { XDG_CONFIG_HOME: path.join(root, "config") },
+      stdout: output,
+      fetchImpl: mocks.fetchImpl,
+      openBrowser: mocks.openBrowser,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(mocks.getAuthorizationUrl()?.searchParams.get("client_id"), "dynamic_agent_client");
+    assert.equal(mocks.getTokenBody()?.get("client_id"), maliciousClientId);
+    assert.equal(mocks.getTokenBody()?.get("code"), oldCode);
+    assert.equal(mocks.getTokenExchangeCount(), 1);
+    assert.match(output.value, /HTTP 400/);
+    assert.match(output.value, /OAuth error=invalid_grant/);
+    assert.match(output.value, /response body shape=error-object/);
+    assert.match(output.value, /client ID 命中终端凭据安全筛查/);
+    assert.match(output.value, /未显示 fresh-auth 命令/);
+    assert.match(output.value, /请勿复用该 code/);
+    assert.match(output.value, /不要再次使用 dynamic_agent_client 注册/);
+    assert.ok(!output.value.includes(maliciousClientId));
+    assert.doesNotMatch(output.value, /--client-id|synthetic-old-authorization-code|synthetic private token detail|synthetic-access-token-never-log/);
+    assert.equal((await readSiwcCredentialStore(storePath))?.accounts.length, 0);
   });
 });
 

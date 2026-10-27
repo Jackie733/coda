@@ -112,7 +112,7 @@ export function safeSiwcAuthorizationErrorText(error: SiwcAuthorizationError, fa
   if (error.code && OAUTH_ERROR_CODES.has(error.code)) allowlistedLiterals.push(`OAuth error=${error.code}`);
   if (error.bodyShape && OAUTH_BODY_SHAPES.has(error.bodyShape)) allowlistedLiterals.push(`response body shape=${error.bodyShape}`);
   // Only this exact validated callback-issued field is public protocol data; all other message text stays scanned.
-  if (error.code === "invalid_grant" && error.issuedClientId && isSafeIssuedClientId(error.issuedClientId) && error.message.includes(error.issuedClientId)) {
+  if (error.code === "invalid_grant" && error.issuedClientId && isSafeIssuedClientIdForDisplay(error.issuedClientId) && error.message.includes(error.issuedClientId)) {
     allowlistedLiterals.push(error.issuedClientId);
   }
   return safeCliErrorText(error.message, fallback, allowlistedLiterals);
@@ -135,13 +135,26 @@ export function isSafeIssuedClientId(value: string): boolean {
   return value !== "dynamic_agent_client" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
 }
 
+const ISSUED_CLIENT_ID_SECRET_PATTERNS = [
+  /^(?:sk(?:[-_]|$)|sess(?:[-_]|$)|whsec_|github_pat_|gh[pousr]_|xox[baprs]-|api[_-]?key|client[_-]?secret|secret|credential|password|authorization[_-]?code|code[_-]?verifier)/i,
+  /^(?:bearer|token|access[_-]?token|refresh[_-]?token|id[_-]?token)/i,
+  /(?:^|[._:-])(?:bearer|token|jwt|secret|credential|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|authorization[_-]?code|code[_-]?verifier|password)(?:$|[._:-])/i,
+  /^eyJ[A-Za-z0-9_-]{8,}\./,
+  /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/,
+] as const;
+
+/** Apply credential checks only before displaying an otherwise protocol-valid issued ID. */
+function isSafeIssuedClientIdForDisplay(value: string): boolean {
+  return isSafeIssuedClientId(value) && !ISSUED_CLIENT_ID_SECRET_PATTERNS.some((pattern) => pattern.test(value));
+}
+
 function tokenExchangeFailureMessage(code: string | undefined, clientId: string, requestPlanUsage: boolean): string {
   if (code === "invalid_grant") {
-    if (isSafeIssuedClientId(clientId)) {
+    if (isSafeIssuedClientIdForDisplay(clientId)) {
       const planUsageOption = requestPlanUsage ? " --plan-usage" : "";
       return `OpenAI 拒绝了本次授权码 (invalid_grant)；请丢弃本次 authorization code，不要再次提交或复用该 code。该尝试关联的 issued client ID 为 ${clientId}。请用全新授权尝试：\`npm run siwc -- login${planUsageOption} --client-id ${clientId}\`。此命令会复用该 issued ID，不会再次使用 dynamic_agent_client 注册。令牌未保存。`;
     }
-    return "OpenAI 拒绝了本次授权码 (invalid_grant)；已丢弃且不会重试。请从 `siwc status` 复制已保存的 issued client ID 并开始全新授权；令牌未保存。";
+    return "OpenAI 拒绝了本次授权码 (invalid_grant)；本次 authorization code 已丢弃且不会重试。回调签发的 client ID 命中终端凭据安全筛查，因此已隐藏该 ID，未显示 fresh-auth 命令。请勿复用该 code，也不要再次使用 dynamic_agent_client 注册。只有在能从可信来源安全确认同一 issued client ID 后，才可开始全新授权；若无法确认，请停止并寻求项目维护者协助。令牌未保存。";
   }
   if (code === "invalid_client") {
     return "OpenAI 拒绝了 SIWC 客户端配置 (invalid_client)；检查并修正官方 client ID/客户端配置后再开始新的授权，不要盲目重试。令牌未保存。";
@@ -465,7 +478,7 @@ export async function runSiwcAuthorization(options: AuthorizationOptions): Promi
         requestId: safeSiwcRequestId(tokenResponse.headers) ?? undefined,
         code,
         bodyShape: oauthBodyShape(errorBody),
-        ...(code === "invalid_grant" && isSafeIssuedClientId(callback.clientId) ? { issuedClientId: callback.clientId } : {}),
+        ...(code === "invalid_grant" && isSafeIssuedClientIdForDisplay(callback.clientId) ? { issuedClientId: callback.clientId } : {}),
       });
     }
     const tokens: unknown = await tokenResponse.json().catch(() => null);

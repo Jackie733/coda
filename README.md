@@ -94,7 +94,7 @@ npm run siwc -- inspect --model <从 models 返回的 slug> "请说明入口与�
 npm run siwc -- logout
 ```
 
-若首次授权的 token exchange 返回 `invalid_grant`，旧 authorization code 会被丢弃；错误提示会显示该回调签发的 client ID。使用 `npm run siwc -- login --plan-usage --client-id <issued-id>` 开始全新授权，继续复用该 ID，不会再次使用 `dynamic_agent_client` 注册。
+若首次授权的 token exchange 返回 `invalid_grant`，旧 authorization code 会被丢弃。只有回调签发的 client ID 未命中终端凭据安全筛查时，错误提示才会显示该 ID 和 `npm run siwc -- login --plan-usage --client-id <issued-id>` 全新授权命令；若命中筛查，ID 与命令会被隐藏，并给出不含该值的安全说明。此筛查只控制终端回显，不改变本次 OAuth token exchange 使用 callback-issued ID 的协议行为。不要复用旧 code，也不要再次使用 `dynamic_agent_client` 注册；只有能从可信来源安全确认同一 issued ID 时才开始全新授权，否则停止并确认安全恢复方式。
 
 只有 `login --plan-usage` 才请求 `chatgpt.tokens.use.direct`（以及官方流程所需的资源/刷新 scopes）；身份登录或缺少实际授予的 plan-use scope 都不能发起计划推理。普通 `login` 默认复用活动账户的已签发 client ID；无活动账户时仅在本机只有一个已保存账户时复用它。多账户且没有活动选择时会 fail closed；可先用 `status` 查看并运行 `select <issued-client-id>`，或显式提供 `--client-id <issued-client-id>`。只有本机尚无已保存账户时才使用官方 `dynamic_agent_client` 注册首个账户；之后复用回调签发的 client ID，不会因普通登录静默新增账户。模型列表来自所选账户当前可见的官方 `/v1/models` 目录，交互终端可选择，非交互终端须显式传 `--model`。
 
