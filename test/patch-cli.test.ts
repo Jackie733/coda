@@ -29,6 +29,7 @@ async function createDirtyRepository(): Promise<Fixture> {
   runGit("init", "-b", "fixture-main");
   setLocalGitConfig(root, "user.email", "fixture@example.invalid");
   setLocalGitConfig(root, "user.name", "Synthetic Fixture");
+  setLocalGitConfig(root, "core.autocrlf", "false");
   await mkdir(path.join(root, "src"), { recursive: true });
   await mkdir(path.join(root, "secrets"), { recursive: true });
   const outsideFile = `${root}-outside.ts`;
@@ -40,6 +41,7 @@ async function createDirtyRepository(): Promise<Fixture> {
   await writeFile(outsideFile, "export const outside = 'never-read';\n");
   await mkdir(hooksDirectory, { recursive: true });
   await writeFile(path.join(root, "src", "main.ts"), 'export function greeting() {\n  return "before";\n}\n');
+  await writeFile(path.join(root, "src", "whitespace.ts"), 'export function whitespace() {\r\n\treturn "before";\r\n}\r\n');
   await writeFile(path.join(root, ".gitattributes"), "src/main.ts filter=fixture-marker\n");
   const postCheckout = path.join(hooksDirectory, "post-checkout");
   await writeFile(postCheckout, `#!/bin/sh\nprintf executed > "${hookMarker}"\n`);
@@ -108,6 +110,7 @@ async function originState(root: string): Promise<Readonly<Record<string, string
     stagedDiff: git(root, "diff", "--cached", "--binary", "HEAD").toString("hex"),
     unstagedDiff: git(root, "diff", "--binary").toString("hex"),
     mainFile: (await readFile(path.join(root, "src", "main.ts"))).toString("hex"),
+    whitespaceFile: (await readFile(path.join(root, "src", "whitespace.ts"))).toString("hex"),
     readmeFile: (await readFile(path.join(root, "README.md"))).toString("hex"),
     untrackedFile: (await readFile(path.join(root, "local-notes.txt"))).toString("hex"),
   };
@@ -126,8 +129,8 @@ function patchContent(options: Readonly<{ path?: string; oldText?: string; newTe
     patches: [{
       path: options.path ?? "src/main.ts",
       edits: [{
-        oldText: options.oldText ?? 'return "before";',
-        newText: options.newText ?? 'return "after";',
+        oldText: options.oldText ?? 'export function greeting() {\n  return "before";\n}',
+        newText: options.newText ?? 'export function greeting() {\n  return "after";\n}',
         reason: "更新问候函数的返回值。",
         citations: [{ path: options.citationPath ?? "src/main.ts", startLine: 1, endLine: 3 }],
       }],
@@ -269,12 +272,55 @@ test("approved patch preview is the exact mock request, diff equals kept worktre
 
     const worktree = keptWorktreePath(output.text);
     const materialized = await readdir(worktree);
+    assert.deepEqual(materialized.sort(), [".git", "src"]);
+    assert.deepEqual(await readdir(path.join(worktree, "src")), ["main.ts"]);
     assert.ok(!materialized.includes(".env.local"));
     assert.ok(!materialized.includes("secrets"));
     const exactDiff = git(worktree, "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "HEAD", "--").toString("utf8");
     assert.ok(exactDiff.length > 0);
     assert.ok(output.text.includes(exactDiff), "displayed diff must exactly match git diff in the kept worktree");
     assert.equal((await readFile(path.join(worktree, "src", "main.ts"), "utf8")).includes('return "after";'), true);
+    assert.deepEqual(await originState(root), before);
+  });
+});
+
+test("normal LF, CR, and TAB source plus multi-line patch text are accepted safely", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const output = captureOutput();
+    const original = 'export function whitespace() {\r\n\treturn "before";\r\n}\r\n';
+    const replacement = 'export function whitespace() {\r\n\treturn "after";\r\n}\r\n';
+    const response = JSON.stringify({
+      patches: [{
+        path: "src/whitespace.ts",
+        edits: [{
+          oldText: original.slice(0, -2),
+          newText: replacement.slice(0, -2),
+          reason: "保留 CRLF 与 TAB，只更新返回值。",
+          citations: [{ path: "src/whitespace.ts", startLine: 1, endLine: 3 }],
+        }],
+      }],
+    });
+    let fetchCalls = 0;
+    const exitCode = await runPatchCli({
+      cwd: root,
+      plan: "只更新 whitespace 函数的返回值。",
+      files: ["src/whitespace.ts"],
+      env: { OPENAI_API_KEY: "mock-only-key", OPENAI_MODEL: "mock-model", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: output.writer,
+      approvePlan: async () => true,
+      confirmSend: async () => true,
+      chooseDisposition: async () => "keep",
+      fetchImpl: async () => { fetchCalls += 1; return mockResponse(response); },
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(fetchCalls, 1);
+    assert.match(output.text, /已生成并保留隔离工作树/);
+    const worktree = keptWorktreePath(output.text);
+    assert.equal(await readFile(path.join(worktree, "src", "whitespace.ts"), "utf8"), replacement);
+    assert.match(output.text, /\\x09/);
+    assert.match(output.text, /\\x0d/);
     assert.deepEqual(await originState(root), before);
   });
 });
@@ -318,6 +364,58 @@ test("malformed model patches fail closed and preserve origin state", async () =
       assert.deepEqual(await originState(root), before);
       assert.equal(git(root, "worktree", "list", "--porcelain").toString("utf8").split("\n").filter((line) => line.startsWith("worktree ")).length, 1);
     }
+  });
+});
+
+test("oversized response stream is cancelled before full buffering, JSON parsing, or patch application", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const output = captureOutput();
+    let pullCalls = 0;
+    let cancelled = false;
+    let tailChunkDelivered = false;
+    let jsonCalls = 0;
+    let dispositionCalls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pullCalls += 1;
+        if (pullCalls <= 2) controller.enqueue(new Uint8Array(300 * 1024));
+        else {
+          tailChunkDelivered = true;
+          controller.enqueue(new Uint8Array(16));
+          controller.close();
+        }
+      },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0, size: (chunk) => chunk.byteLength });
+    const response = new Response(body, { status: 200 });
+    Object.defineProperty(response, "json", {
+      value: async () => {
+        jsonCalls += 1;
+        return { choices: [{ message: { content: patchContent() } }] };
+      },
+    });
+    const exitCode = await runPatchCli({
+      cwd: root,
+      plan: "只更新 greeting 的返回值。",
+      files: ["src/main.ts"],
+      env: { OPENAI_API_KEY: "mock-only-key", OPENAI_MODEL: "mock-model", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: output.writer,
+      approvePlan: async () => true,
+      confirmSend: async () => true,
+      chooseDisposition: async () => { dispositionCalls += 1; return "keep"; },
+      fetchImpl: async () => response,
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(pullCalls, 2);
+    assert.equal(cancelled, true);
+    assert.equal(tailChunkDelivered, false);
+    assert.equal(jsonCalls, 0);
+    assert.equal(dispositionCalls, 0);
+    assert.match(output.text, /HTTP 响应超过 524288 字节上限/);
+    assert.doesNotMatch(output.text, /已生成并保留隔离工作树|候选补丁在隔离工作树中相对基准 HEAD 的完整 diff/);
+    assert.deepEqual(await originState(root), before);
   });
 });
 

@@ -11,7 +11,8 @@ import { containsLikelySecret, CONTEXT_LIMITS, isSafeRepositoryPath } from "./re
 
 const execFileAsync = promisify(execFile);
 const GIT_ENV_KEYS = ["PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL"] as const;
-const DISALLOWED_OUTPUT_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
+const DISALLOWED_OUTPUT_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028-\u2029\u202a-\u202e\u2066-\u2069]/;
+const DISALLOWED_SOURCE_CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u2029\u202a-\u202e\u2066-\u2069]/;
 const SAFE_SPARSE_SEGMENT = /^[A-Za-z0-9._+@-]+$/;
 const MAX_PLAN_CHARS = 2_000;
 const MAX_APPROVED_FILES = CONTEXT_LIMITS.maxFiles;
@@ -235,6 +236,25 @@ async function allocateOwnedWorktree(
   return Object.freeze({ repositoryRoot, parentDirectory, worktreePath, baseCommit, disabledFilters: Object.freeze([...disabledFilters]) });
 }
 
+function exactSparsePatterns(approvedFiles: readonly string[]): readonly string[] {
+  const parentDirectories = new Set<string>();
+  for (const file of approvedFiles) {
+    const segments = file.split("/");
+    for (let end = 1; end < segments.length; end += 1) {
+      parentDirectories.add(segments.slice(0, end).join("/"));
+    }
+  }
+  const orderedParents = [...parentDirectories].sort((left, right) =>
+    left.split("/").length - right.split("/").length || left.localeCompare(right),
+  );
+  const patterns = ["/*", "!/*"];
+  for (const directory of orderedParents) {
+    patterns.push(`/${directory}/`, `!/${directory}/*`);
+  }
+  for (const file of approvedFiles) patterns.push(`/${file}`);
+  return Object.freeze(patterns);
+}
+
 async function initializeOwnedWorktree(owned: OwnedWorktree, approvedFiles: readonly string[]): Promise<void> {
   await runGit(
     ["worktree", "add", "--no-checkout", "--detach", owned.worktreePath, owned.baseCommit],
@@ -242,12 +262,17 @@ async function initializeOwnedWorktree(owned: OwnedWorktree, approvedFiles: read
     256 * 1024,
     owned.disabledFilters,
   );
+  // Non-cone patterns need each parent included explicitly; exclude its children before re-including only approved paths.
+  const sparsePatterns = exactSparsePatterns(approvedFiles);
   await runGit(
-    ["sparse-checkout", "set", "--no-cone", "--", ...approvedFiles],
+    ["sparse-checkout", "set", "--no-cone", "--", ...sparsePatterns],
     owned.worktreePath,
     256 * 1024,
     owned.disabledFilters,
   );
+  // Git 2.43 may write a single-file pattern without materializing it; force only exact approved index paths into the worktree.
+  await runGit(["update-index", "--no-skip-worktree", "--", ...approvedFiles], owned.worktreePath, 256 * 1024, owned.disabledFilters);
+  await runGit(["checkout-index", "--force", "--", ...approvedFiles], owned.worktreePath, 256 * 1024, owned.disabledFilters);
   const canonicalWorktree = await realpath(owned.worktreePath);
   const canonicalParent = await realpath(owned.parentDirectory);
   if (canonicalWorktree !== owned.worktreePath || path.dirname(canonicalWorktree) !== canonicalParent) {
@@ -363,7 +388,7 @@ async function readSafeSourceFile(root: string, relativePath: string): Promise<s
     } catch {
       throw new Error(`目标文件不是有效 UTF-8 文本：${visibleControls(relativePath)}`);
     }
-    if (DISALLOWED_OUTPUT_CONTROLS.test(text) || containsLikelySecret(text)) {
+    if (DISALLOWED_SOURCE_CONTROLS.test(text) || containsLikelySecret(text)) {
       throw new Error(`目标文件含有不适合补丁流程的控制字符或疑似凭据：${visibleControls(relativePath)}`);
     }
     return text;
@@ -379,7 +404,7 @@ async function writeSafeSourceFile(root: string, relativePath: string, expectedO
   if (Buffer.byteLength(updatedContent, "utf8") > CONTEXT_LIMITS.maxFileBytes) {
     throw new Error(`补丁后文件超过 ${CONTEXT_LIMITS.maxFileBytes} 字节限制：${visibleControls(relativePath)}`);
   }
-  if (DISALLOWED_OUTPUT_CONTROLS.test(updatedContent) || containsLikelySecret(updatedContent)) {
+  if (DISALLOWED_SOURCE_CONTROLS.test(updatedContent) || containsLikelySecret(updatedContent)) {
     throw new Error(`补丁结果含有控制字符或疑似凭据，拒绝写入：${visibleControls(relativePath)}`);
   }
   const handle = await open(canonical, constants.O_WRONLY | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0));
@@ -452,8 +477,8 @@ function validatePatchResponse(
         Buffer.byteLength(oldText, "utf8") > CONTEXT_LIMITS.maxFileBytes ||
         Buffer.byteLength(newText, "utf8") > CONTEXT_LIMITS.maxFileBytes ||
         Buffer.byteLength(reason, "utf8") > 2_000 ||
-        DISALLOWED_OUTPUT_CONTROLS.test(oldText) ||
-        DISALLOWED_OUTPUT_CONTROLS.test(newText) ||
+        DISALLOWED_SOURCE_CONTROLS.test(oldText) ||
+        DISALLOWED_SOURCE_CONTROLS.test(newText) ||
         DISALLOWED_OUTPUT_CONTROLS.test(reason)
       ) throw new Error(`编辑内容、理由或引用无效：${visibleControls(file)}`);
       const safeCitations = citations.map((citation) => validateCitation(citation, approvedSet, originals));
@@ -491,7 +516,7 @@ function applyEdits(original: string, patch: ValidatedPatch): string {
   if (Buffer.byteLength(content, "utf8") > CONTEXT_LIMITS.maxFileBytes) {
     throw new Error(`补丁后文件超出 ${CONTEXT_LIMITS.maxFileBytes} 字节限制：${visibleControls(patch.path)}`);
   }
-  if (DISALLOWED_OUTPUT_CONTROLS.test(content) || containsLikelySecret(content)) {
+  if (DISALLOWED_SOURCE_CONTROLS.test(content) || containsLikelySecret(content)) {
     throw new Error(`补丁结果含有控制字符或疑似凭据：${visibleControls(patch.path)}`);
   }
   return content;
@@ -544,6 +569,57 @@ function parseModelContent(result: unknown): string | null {
   const first = result.choices[0];
   if (!isRecord(first) || !isRecord(first.message)) return null;
   return typeof first.message.content === "string" && first.message.content.trim() ? first.message.content : null;
+}
+
+async function readBoundedResponseJson(response: Response): Promise<unknown> {
+  if (!response.body) throw new Error("模型响应缺少可读取的 body；未应用补丁。");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let cancellationRequested = false;
+  const cancelBody = async () => {
+    if (cancellationRequested) return;
+    cancellationRequested = true;
+    await reader.cancel().catch(() => undefined);
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      if (value.byteLength > MAX_PATCH_RESPONSE_BYTES - totalBytes) {
+        await cancelBody();
+        throw new Error(`模型 HTTP 响应超过 ${MAX_PATCH_RESPONSE_BYTES} 字节上限；未应用补丁。`);
+      }
+      const chunk = value.slice();
+      chunks.push(chunk);
+      totalBytes += chunk.byteLength;
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new Error("模型响应不是有效 UTF-8 JSON；未应用补丁。");
+    }
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      throw new Error("模型响应不是有效 JSON；未应用补丁。");
+    }
+  } catch (error) {
+    await cancelBody();
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function makePatchRequest(plan: string, approvedFiles: readonly string[], context: string, model: string) {
@@ -675,7 +751,7 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
     if (Buffer.byteLength(approvedContext, "utf8") > CONTEXT_LIMITS.maxTotalBytes) {
       throw new Error(`批准文件上下文超过 ${CONTEXT_LIMITS.maxTotalBytes} 字节限制。`);
     }
-    if (visibleControls(approvedContext) !== approvedContext) throw new Error("批准文件上下文含终端控制字符；拒绝生成可能改变终端行为的请求预览。");
+    if (DISALLOWED_SOURCE_CONTROLS.test(approvedContext)) throw new Error("批准文件上下文含危险控制字符；拒绝生成可能改变终端行为的请求预览。");
 
     const model = env.OPENAI_MODEL || "gpt-4.1-mini";
     if (!model.trim() || model.length > 256 || DISALLOWED_OUTPUT_CONTROLS.test(model)) throw new Error("OPENAI_MODEL 含无效或终端控制字符。");
@@ -734,7 +810,7 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
       signal: AbortSignal.timeout(30_000),
     });
     if (!response.ok) throw new Error(`模型请求失败（HTTP ${response.status}）；未应用补丁。`);
-    const result: unknown = await response.json().catch(() => null);
+    const result = await readBoundedResponseJson(response);
     const content = parseModelContent(result);
     if (!content) throw new Error("模型响应格式无效；未应用补丁。");
     if (Buffer.byteLength(content, "utf8") > MAX_PATCH_RESPONSE_BYTES) throw new Error("模型补丁响应超过安全大小限制；未应用补丁。");
