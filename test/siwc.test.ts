@@ -51,6 +51,8 @@ import { readSiwcTuiStatus } from "../src/siwc/ui-status.js";
 import { runSiwcCli } from "../src/siwc-cli.js";
 
 const ISSUED_CLIENT_ID = "oaiapp_synthetic_client";
+const NORMAL_LONG_ISSUED_CLIENT_ID = "oaiapp_K8m2Q5r9T3v7X1z4B6n0P5s8D2f7H1J6k";
+const SYNTHETIC_HIGH_ENTROPY_PAYLOAD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const NORMAL_REQUEST_ID = "req_0123456789abcdef0123456789ab";
 const CALLBACK_ACCESS_TOKEN = "synthetic-access-token-never-log";
 const CALLBACK_REFRESH_TOKEN = "synthetic-refresh-token-never-log";
@@ -70,9 +72,15 @@ async function signedIdToken(input: Readonly<{
   aud?: string;
   iss?: string;
   expired?: boolean;
+  email?: string | null;
+  name?: string | null;
 }>): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
-  return new SignJWT({ nonce: input.nonce ?? "synthetic-nonce", email: "fixture@example.invalid", name: "Synthetic User" })
+  return new SignJWT({
+    nonce: input.nonce ?? "synthetic-nonce",
+    ...(input.email === null ? {} : { email: input.email ?? "fixture@example.invalid" }),
+    ...(input.name === null ? {} : { name: input.name ?? "Synthetic User" }),
+  })
     .setProtectedHeader({ alg: "RS256", kid: "synthetic-key-1" })
     .setIssuer(input.iss ?? SIWC_ISSUER)
     .setAudience(input.aud ?? ISSUED_CLIENT_ID)
@@ -656,7 +664,7 @@ test("OAuth authorization error formatter sanitizes the final message and narrow
   assert.match(text, new RegExp(`request ID=${requestId}`));
   assert.match(text, /start a fresh authorization/);
 
-  const longIssuedClientId = `oaiapp_${"a".repeat(33)}`;
+  const longIssuedClientId = NORMAL_LONG_ISSUED_CLIENT_ID;
   const recoveryText = `issued client ID 为 ${longIssuedClientId}; npm run siwc -- login --client-id ${longIssuedClientId}`;
   const structuredClientIdError = new SiwcAuthorizationError(recoveryText, {
     code: "invalid_grant",
@@ -683,9 +691,15 @@ test("OAuth authorization error formatter sanitizes the final message and narrow
     "Bearer-secretvalue0123456789abcdef",
     "api_key_syntheticsecret1234567890",
     "ghp_syntheticgithubtoken1234567890",
+    "oaiapp_sk-proj-syntheticsecret1234567890",
+    "oaiapp_ghp_syntheticgithubtoken1234567890",
+    "oaiapp_xoxb-synthetictoken1234567890",
+    "oaiapp_whsec_syntheticsecret1234567890",
     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature_12345678",
+    "oaiapp_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature_12345678",
     "oaiapp_access_token_syntheticsecret123",
     "oaiapp_secret_syntheticvalue1234567890",
+    `oaiapp_${SYNTHETIC_HIGH_ENTROPY_PAYLOAD}`,
   ];
   for (const issuedClientId of secretLikeClientIds) {
     assert.equal(isSafeIssuedClientId(issuedClientId), true);
@@ -694,6 +708,16 @@ test("OAuth authorization error formatter sanitizes the final message and narrow
       issuedClientId,
     });
     assert.equal(safeSiwcAuthorizationErrorText(unsafeDisplayError, fallback), fallback);
+  }
+  for (const issuedClientId of [
+    "oaiapp_s\u200bk-proj-syntheticsecret1234567890",
+    "oaiapp_sk-\u200eproj-syntheticsecret1234567890",
+  ]) {
+    const hiddenControlError = new SiwcAuthorizationError(`Issued client ID=${issuedClientId}`, {
+      code: "invalid_grant",
+      issuedClientId,
+    });
+    assert.equal(safeSiwcAuthorizationErrorText(hiddenControlError, fallback), fallback);
   }
 });
 
@@ -827,7 +851,7 @@ test("OAuth discovery, JWKS, and token-exchange failures sanitize request IDs th
 
 test("first-registration invalid_grant reauthorizes with the issued client ID and a fresh authorization code", async () => {
   await withTemporaryStore(async (storePath, root) => {
-    const issuedClientId = `oaiapp_${"a".repeat(33)}`;
+    const issuedClientId = NORMAL_LONG_ISSUED_CLIENT_ID;
     const maliciousRequestId = "sk-proj-syntheticsecret1234567890";
     const secretDescription = `synthetic private token detail ${CALLBACK_ACCESS_TOKEN}`;
     assert.equal(issuedClientId.length, 40);
@@ -884,45 +908,117 @@ test("first-registration invalid_grant reauthorizes with the issued client ID an
     assert.notEqual(retry.getTokenBody()?.get("code"), first.getTokenBody()?.get("code"));
     assert.equal(retry.getTokenExchangeCount(), 1);
     assert.equal((await readSiwcCredentialStore(storePath))?.accounts[0]?.clientId, issuedClientId);
+    const retryStatus = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({ argv: ["status"], env, stdout: retryStatus }), 0);
+    assert.ok(retryStatus.value.includes(`fixture@example.invalid · ${issuedClientId}`));
   });
 });
 
-test("first-registration invalid_grant hides credential-like callback client IDs from CLI output", async () => {
-  await withTemporaryStore(async (storePath, root) => {
-    const maliciousClientId = "sk-proj-syntheticsecret1234567890";
-    const oldCode = "synthetic-old-authorization-code";
-    const secretDetail = `synthetic private token detail ${CALLBACK_ACCESS_TOKEN}`;
-    assert.equal(isSafeIssuedClientId(maliciousClientId), true);
-    const mocks = makeAuthorizationMocks({
-      callbackCode: oldCode,
-      callbackClientId: maliciousClientId,
-      tokenError: { code: "invalid_grant", status: 400, description: secretDetail },
-    });
-    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
-    const exitCode = await runSiwcCli({
-      argv: ["login", "--plan-usage"],
-      env: { XDG_CONFIG_HOME: path.join(root, "config") },
-      stdout: output,
-      fetchImpl: mocks.fetchImpl,
-      openBrowser: mocks.openBrowser,
-    });
+test("first-registration invalid_grant hides wrapped credential-like callback IDs from CLI output", async () => {
+  const maliciousClientIds = [
+    "oaiapp_sk-proj-syntheticsecret1234567890",
+    "oaiapp_ghp_syntheticgithubtoken1234567890",
+    "oaiapp_xoxb-synthetictoken1234567890",
+    "oaiapp_whsec_syntheticsecret1234567890",
+    "oaiapp_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature_12345678",
+    `oaiapp_${SYNTHETIC_HIGH_ENTROPY_PAYLOAD}`,
+  ] as const;
+  for (const [index, maliciousClientId] of maliciousClientIds.entries()) {
+    await withTemporaryStore(async (storePath, root) => {
+      const oldCode = `synthetic-old-authorization-code-${index}`;
+      const secretDetail = `synthetic private token detail ${CALLBACK_ACCESS_TOKEN}`;
+      assert.equal(isSafeIssuedClientId(maliciousClientId), true);
+      const mocks = makeAuthorizationMocks({
+        callbackCode: oldCode,
+        callbackClientId: maliciousClientId,
+        tokenError: { code: "invalid_grant", status: 400, description: secretDetail },
+      });
+      const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+      const exitCode = await runSiwcCli({
+        argv: ["login", "--plan-usage"],
+        env: { XDG_CONFIG_HOME: path.join(root, "config") },
+        stdout: output,
+        fetchImpl: mocks.fetchImpl,
+        openBrowser: mocks.openBrowser,
+      });
 
-    assert.equal(exitCode, 1);
-    assert.equal(mocks.getAuthorizationUrl()?.searchParams.get("client_id"), "dynamic_agent_client");
-    assert.equal(mocks.getTokenBody()?.get("client_id"), maliciousClientId);
-    assert.equal(mocks.getTokenBody()?.get("code"), oldCode);
-    assert.equal(mocks.getTokenExchangeCount(), 1);
-    assert.match(output.value, /HTTP 400/);
-    assert.match(output.value, /OAuth error=invalid_grant/);
-    assert.match(output.value, /response body shape=error-object/);
-    assert.match(output.value, /client ID 命中终端凭据安全筛查/);
-    assert.match(output.value, /未显示 fresh-auth 命令/);
-    assert.match(output.value, /请勿复用该 code/);
-    assert.match(output.value, /不要再次使用 dynamic_agent_client 注册/);
-    assert.ok(!output.value.includes(maliciousClientId));
-    assert.doesNotMatch(output.value, /--client-id|synthetic-old-authorization-code|synthetic private token detail|synthetic-access-token-never-log/);
-    assert.equal((await readSiwcCredentialStore(storePath))?.accounts.length, 0);
+      assert.equal(exitCode, 1);
+      assert.equal(mocks.getAuthorizationUrl()?.searchParams.get("client_id"), "dynamic_agent_client");
+      assert.equal(mocks.getTokenBody()?.get("client_id"), maliciousClientId);
+      assert.equal(mocks.getTokenBody()?.get("code"), oldCode);
+      assert.equal(mocks.getTokenExchangeCount(), 1);
+      assert.match(output.value, /HTTP 400/);
+      assert.match(output.value, /OAuth error=invalid_grant/);
+      assert.match(output.value, /response body shape=error-object/);
+      assert.match(output.value, /client ID 命中终端凭据安全筛查/);
+      assert.match(output.value, /未显示 fresh-auth 命令/);
+      assert.match(output.value, /请勿复用该 code/);
+      assert.match(output.value, /不要再次使用 dynamic_agent_client 注册/);
+      assert.ok(!output.value.includes(maliciousClientId));
+      assert.doesNotMatch(output.value, /--client-id|synthetic-old-authorization-code|synthetic private token detail|synthetic-access-token-never-log/);
+      assert.equal((await readSiwcCredentialStore(storePath))?.accounts.length, 0);
+    });
+  }
+});
+
+test("secret-like client IDs are redacted across local CLI display paths without changing selection or exchange", async () => {
+  await withTemporaryStore(async (storePath, root) => {
+    const clientId = "oaiapp_sk-proj-syntheticsecret1234567890";
+    const env = { XDG_CONFIG_HOME: path.join(root, "config") };
+    assert.equal(isSafeIssuedClientId(clientId), true);
+
+    const loginMocks = makeAuthorizationMocks({ callbackClientId: clientId, tokenClaims: { aud: clientId, email: null } });
+    const loginOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({
+      argv: ["login", "--plan-usage"], env, stdout: loginOutput,
+      fetchImpl: loginMocks.fetchImpl, openBrowser: loginMocks.openBrowser,
+    }), 0);
+    assert.equal(loginMocks.getTokenBody()?.get("client_id"), clientId);
+    assert.match(loginOutput.value, /SIWC 登录已验证并保存在本机/);
+    assert.match(loginOutput.value, /账户：\[client ID 已隐藏：命中终端凭据安全筛查\]/);
+    assert.ok(!loginOutput.value.includes(clientId));
+
+    const statusOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({ argv: ["status"], env, stdout: statusOutput }), 0);
+    assert.match(statusOutput.value, /活动账户：\[client ID 已隐藏：命中终端凭据安全筛查\]/);
+    assert.ok(!statusOutput.value.includes(clientId));
+
+    const selectOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({ argv: ["select", clientId], env, stdout: selectOutput }), 0);
+    assert.match(selectOutput.value, /活动 SIWC 账户已切换为 \[client ID 已隐藏：命中终端凭据安全筛查\]/);
+    assert.ok(!selectOutput.value.includes(clientId));
+
+    const logoutFetch: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url === SIWC_DISCOVERY_URL) return Response.json(oidcMetadata());
+      if (url === `${SIWC_ISSUER}/api/accounts/oauth/revoke`) {
+        assert.equal(new URLSearchParams(String(init?.body ?? "")).get("token"), CALLBACK_REFRESH_TOKEN);
+        return new Response(null, { status: 200 });
+      }
+      throw new Error("Unexpected synthetic logout target");
+    };
+    const logoutOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({ argv: ["logout", "--client-id", clientId], env, stdout: logoutOutput, fetchImpl: logoutFetch }), 0);
+    assert.match(logoutOutput.value, /已从本机清除 \[client ID 已隐藏：命中终端凭据安全筛查\]/);
+    assert.ok(!logoutOutput.value.includes(clientId));
+    assert.doesNotMatch(logoutOutput.value, /synthetic-(?:access|refresh)-token-never-log/);
+
+    const loggedOutStore = await readSiwcCredentialStore(storePath);
+    assert.ok(loggedOutStore?.accounts[0]);
+    await saveSiwcAccount(storePath, Object.freeze({ ...loggedOutStore.accounts[0], email: "synthetic-display@example.invalid" }));
+    const emailStatusOutput = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    assert.equal(await runSiwcCli({ argv: ["status"], env, stdout: emailStatusOutput }), 0);
+    assert.match(emailStatusOutput.value, /synthetic-display@example\.invalid · \[client ID 已隐藏：命中终端凭据安全筛查\]/);
+    assert.ok(!emailStatusOutput.value.includes(clientId));
   });
+});
+
+test("SIWC CLI help describes credential-filtered invalid_grant recovery conditionally", async () => {
+  const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+  assert.equal(await runSiwcCli({ argv: ["--help"], stdout: output }), 0);
+  assert.match(output.value, /只有回调签发 ID 未命中终端凭据安全筛查时/);
+  assert.match(output.value, /若命中，ID 和命令会隐藏并给出不含该值的安全说明/);
+  assert.doesNotMatch(output.value, /错误会给出回调签发 ID 与全新授权命令/);
 });
 
 test("reauthorization rejects a callback client ID that does not match the selected account", async () => {

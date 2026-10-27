@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import { CredentialDurabilityUncertainError, updateSiwcCredentialStore, accountFromStore, planUsageAuthorized, readSiwcCredentialStore, resolveSiwcStorePath, siwcAccountStatuses } from "./siwc/credential-store.js";
-import { isSafeIssuedClientId, runSiwcAuthorization, safeSiwcAuthorizationErrorText, SiwcAuthorizationError, type AuthorizationOptions } from "./siwc/oauth.js";
+import { isSafeIssuedClientId, isSafeIssuedClientIdForDisplay, runSiwcAuthorization, safeSiwcAuthorizationErrorText, SiwcAuthorizationError, type AuthorizationOptions } from "./siwc/oauth.js";
 import { getSiwcAccessTokenForUsage, logoutSiwcAccount } from "./siwc/session.js";
 import { createSiwcResponsesProvider, listSiwcModels, safeSiwcProviderErrorText, SIWC_PLAN_USAGE_NOTICE, SIWC_USAGE_URL, SiwcProviderError } from "./siwc/responses-provider.js";
 import { runReadonlyCli, visibleControls, type ReadonlyCliOptions } from "./readonly-cli.js";
@@ -21,7 +21,7 @@ const USAGE = [
   "",
   "login 默认只请求身份 scope；没有 --client-id 时优先复用活动 issued client ID，其次仅在只有一个已保存账户时复用它。",
   "多个账户且没有活动选择时拒绝猜测；仅在没有保存账户且未显式给出 issued ID 时才使用官方 dynamic_agent_client 注册首个账户。",
-  "首次注册若授权码返回 invalid_grant，错误会给出回调签发 ID 与全新授权命令；用该 ID 重新授权，不会再次 dynamic-register。",
+  "首次注册若授权码返回 invalid_grant，旧 authorization code 会被丢弃；只有回调签发 ID 未命中终端凭据安全筛查时，错误才会显示该 ID 与全新授权命令。若命中，ID 和命令会隐藏并给出不含该值的安全说明。重试必须使用全新授权 code 与同一 issued ID，不会再次 dynamic-register。",
   "只有显式加 --plan-usage 才请求 ChatGPT 计划用量权限。",
   "ChatGPT plan 使用和 OpenAI API key 计费分开；不会自动兜底或切换。",
   `Manage usage：${SIWC_USAGE_URL}`,
@@ -45,6 +45,10 @@ type SiwcCliOptions = Readonly<{
 
 function write(stdout: Writer, text: string): void {
   stdout.write(text);
+}
+
+function displayIssuedClientId(clientId: string): string {
+  return isSafeIssuedClientIdForDisplay(clientId) ? clientId : "[client ID 已隐藏：命中终端凭据安全筛查]";
 }
 
 function safeError(error: unknown): string {
@@ -132,7 +136,8 @@ async function printStatus(stdout: Writer, storePath: string): Promise<void> {
   } else {
     for (const status of statuses) {
       const active = status.isActive ? "活动账户" : "已保存账户";
-      const label = status.email ? `${status.email} · ${status.clientId}` : status.clientId;
+      const displayedClientId = displayIssuedClientId(status.clientId);
+      const label = status.email ? `${status.email} · ${displayedClientId}` : displayedClientId;
       const authorization = status.planUsageAuthorized ? "已授予 plan-use scope" : "未授予 plan-use scope";
       const session = status.signedIn
         ? status.expiresAt === null ? "有身份凭据，access token 状态未知/需重新授权" : `access token 到期：${new Date(status.expiresAt).toISOString()}`
@@ -190,7 +195,7 @@ async function runLogin(args: readonly string[], options: SiwcCliOptions, stdout
     fetchImpl: options.fetchImpl,
     openBrowser: options.openBrowser ?? defaultOpenBrowser,
   });
-  const accountLabel = result.account.email ?? result.account.clientId;
+  const accountLabel = result.account.email ?? displayIssuedClientId(result.account.clientId);
   write(stdout, `SIWC 登录已验证并保存在本机（账户：${accountLabel}；token 未显示）。\n`);
   if (result.planUsageAuthorized) {
     write(stdout, "ChatGPT plan use 已启用；后续推理只会使用此账户授权的 plan/credits，不会切到 API key。\n");
@@ -210,7 +215,7 @@ async function runSelect(clientId: string | undefined, stdout: Writer, storePath
     return Object.freeze({ ...current, activeClientId: clientId });
   });
   const account = accountFromStore(updated, clientId);
-  write(stdout, `活动 SIWC 账户已切换为 ${account.email ?? account.clientId}。API-key 模式未改变。\n`);
+  write(stdout, `活动 SIWC 账户已切换为 ${account.email ?? displayIssuedClientId(account.clientId)}。API-key 模式未改变。\n`);
   return 0;
 }
 
@@ -279,7 +284,7 @@ async function runLogout(args: readonly string[], stdout: Writer, storePath: str
   if (!store) throw new Error("本机没有 SIWC 账户凭据。");
   const account = accountFromStore(store, clientId);
   const result = await logoutSiwcAccount({ storePath, clientId: account.clientId, fetchImpl });
-  write(stdout, `已从本机清除 ${account.email ?? account.clientId} 的 access、refresh 与 ID token。\n`);
+  write(stdout, `已从本机清除 ${account.email ?? displayIssuedClientId(account.clientId)} 的 access、refresh 与 ID token。\n`);
   if (result.remoteRevoked) write(stdout, "OpenAI renewable session 撤销已确认（HTTP 200）。\n");
   else if (result.hadRefreshToken) write(stdout, `远端撤销未确认；本机凭据已清除，可在 ChatGPT 设置中断开该应用：${SIWC_USAGE_URL}\n`);
   else write(stdout, "没有本地 refresh token 可撤销；本机凭据已清除。\n");

@@ -112,7 +112,8 @@ export function safeSiwcAuthorizationErrorText(error: SiwcAuthorizationError, fa
   if (error.code && OAUTH_ERROR_CODES.has(error.code)) allowlistedLiterals.push(`OAuth error=${error.code}`);
   if (error.bodyShape && OAUTH_BODY_SHAPES.has(error.bodyShape)) allowlistedLiterals.push(`response body shape=${error.bodyShape}`);
   // Only this exact validated callback-issued field is public protocol data; all other message text stays scanned.
-  if (error.code === "invalid_grant" && error.issuedClientId && isSafeIssuedClientIdForDisplay(error.issuedClientId) && error.message.includes(error.issuedClientId)) {
+  if (error.code === "invalid_grant" && error.issuedClientId && error.message.includes(error.issuedClientId)) {
+    if (!isSafeIssuedClientIdForDisplay(error.issuedClientId)) return fallback;
     allowlistedLiterals.push(error.issuedClientId);
   }
   return safeCliErrorText(error.message, fallback, allowlistedLiterals);
@@ -135,17 +136,35 @@ export function isSafeIssuedClientId(value: string): boolean {
   return value !== "dynamic_agent_client" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
 }
 
+const ISSUED_CLIENT_ID_INVISIBLE_CONTROLS = /[\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
 const ISSUED_CLIENT_ID_SECRET_PATTERNS = [
-  /^(?:sk(?:[-_]|$)|sess(?:[-_]|$)|whsec_|github_pat_|gh[pousr]_|xox[baprs]-|api[_-]?key|client[_-]?secret|secret|credential|password|authorization[_-]?code|code[_-]?verifier)/i,
-  /^(?:bearer|token|access[_-]?token|refresh[_-]?token|id[_-]?token)/i,
+  /(?:^|[._:-])(?:sk(?:[-_]|$)|sess(?:[-_]|$)|whsec_|github_pat_|gh[pousr]_|xox[baprs]-|hf_|pplx-|r8_|AIza[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|api[_-]?key|client[_-]?secret|secret|credential|password|authorization[_-]?code|code[_-]?verifier)/i,
+  /(?:^|[._:-])(?:bearer|token|access[_-]?token|refresh[_-]?token|id[_-]?token)/i,
   /(?:^|[._:-])(?:bearer|token|jwt|secret|credential|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|authorization[_-]?code|code[_-]?verifier|password)(?:$|[._:-])/i,
-  /^eyJ[A-Za-z0-9_-]{8,}\./,
-  /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/,
+  /(?:^|[._:-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
 ] as const;
 
+function isLongHighEntropyOpaqueId(value: string): boolean {
+  // Keep normal 40-character issued IDs displayable; only unusually long opaque values hit this heuristic.
+  if (value.length < 48 || !/^[A-Za-z0-9_-]+$/.test(value)) return false;
+  const frequencies = new Map<string, number>();
+  for (const character of value) frequencies.set(character, (frequencies.get(character) ?? 0) + 1);
+  if (frequencies.size < 16) return false;
+  const entropy = [...frequencies.values()].reduce((sum, count) => {
+    const probability = count / value.length;
+    return sum - probability * Math.log2(probability);
+  }, 0);
+  return entropy >= 4;
+}
+
 /** Apply credential checks only before displaying an otherwise protocol-valid issued ID. */
-function isSafeIssuedClientIdForDisplay(value: string): boolean {
-  return isSafeIssuedClientId(value) && !ISSUED_CLIENT_ID_SECRET_PATTERNS.some((pattern) => pattern.test(value));
+export function isSafeIssuedClientIdForDisplay(value: string): boolean {
+  const normalized = value.replace(ISSUED_CLIENT_ID_INVISIBLE_CONTROLS, "");
+  const payload = normalized.replace(/^oaiapp_/i, "");
+  const candidates = [normalized, payload];
+  const resemblesCredential = candidates.some((candidate) =>
+    ISSUED_CLIENT_ID_SECRET_PATTERNS.some((pattern) => pattern.test(candidate)) || isLongHighEntropyOpaqueId(candidate));
+  return normalized === value && isSafeIssuedClientId(value) && !resemblesCredential;
 }
 
 function tokenExchangeFailureMessage(code: string | undefined, clientId: string, requestPlanUsage: boolean): string {
