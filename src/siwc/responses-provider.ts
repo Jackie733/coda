@@ -7,6 +7,20 @@ export const SIWC_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
 export const SIWC_MODELS_ENDPOINT = "https://api.openai.com/v1/models";
 export const SIWC_USAGE_URL = "https://chatgpt.com/settings/usage";
 export const SIWC_PLAN_USAGE_NOTICE = "用量/共享规则取决于 ChatGPT plan，本 CLI 无法识别账户方案。OpenAI 当前说明：Plus 的五小时 Work/Codex 限额跨适用应用共享；Pro 100/200/500 当前没有这项五小时限额，但仍有包含额度。还可能另有 app-specific limit；不推断其他额度规则。请查看 Usage 页面了解适用限额。";
+const PUBLIC_SIWC_ERROR_CODES = new Set([
+  "subscription_sharing_usage_limit_exceeded",
+  "subscription_sharing_usage_unavailable",
+  "subscription_sharing_user_unavailable",
+  "subscription_sharing_user_not_eligible",
+  "subscription_sharing_unsupported_capability",
+  "subscription_sharing_route_not_supported",
+  "subscription_sharing_invalid_user",
+  "chatpass_v2_scope_not_authorized",
+  "chatpass_v2_invalid_authorization_context",
+  "unsupported_parameter",
+  "unsupported_capability",
+  "unsupported_value",
+]);
 
 export type SiwcModel = Readonly<{ slug: string; displayName: string }>;
 export type ResponseBodyShape = "error-object" | "detail-object" | "object" | "array" | "scalar" | "empty" | "unreadable";
@@ -51,22 +65,10 @@ export class SiwcProviderError extends Error {
 }
 
 export function safeSiwcProviderErrorText(error: SiwcProviderError, fallback: string): string {
-  const publicCodes = new Set([
-    "subscription_sharing_usage_limit_exceeded",
-    "subscription_sharing_usage_unavailable",
-    "subscription_sharing_user_unavailable",
-    "subscription_sharing_user_not_eligible",
-    "subscription_sharing_unsupported_capability",
-    "subscription_sharing_route_not_supported",
-    "subscription_sharing_invalid_user",
-    "chatpass_v2_scope_not_authorized",
-    "chatpass_v2_invalid_authorization_context",
-    "unsupported_parameter",
-    "unsupported_capability",
-    "unsupported_value",
-  ]);
+  // Only exact, validated structured literals are exempted; message and diagnostic detail remain scanned.
   const allowlistedLiterals = [SIWC_USAGE_URL, SIWC_RESPONSES_ENDPOINT];
-  if (error.code && publicCodes.has(error.code)) allowlistedLiterals.push(`error.code=${error.code}`);
+  if (error.code && PUBLIC_SIWC_ERROR_CODES.has(error.code)) allowlistedLiterals.push(`error.code=${error.code}`);
+  if (error.requestId && isSafeRequestId(error.requestId)) allowlistedLiterals.push(`request ID=${error.requestId}`);
   return safeCliErrorText(error.toUserMessage(), fallback, allowlistedLiterals);
 }
 
@@ -79,9 +81,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isSafeRequestId(value: string): boolean {
+  return /^[A-Za-z0-9._:-]{1,128}$/.test(value);
+}
+
 function safeRequestId(headers: Headers): string | null {
   const value = headers.get("openai-request-id") ?? headers.get("x-request-id");
-  return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : null;
+  return value && isSafeRequestId(value) ? value : null;
 }
 
 function safeCode(value: unknown): string | null {

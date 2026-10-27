@@ -1575,6 +1575,56 @@ test("readonly CLI suppresses a U+200E-obfuscated short token from the built-in 
   assert.doesNotMatch(output.value, /API-key fallback must not run/);
 });
 
+test("readonly CLI preserves usage-limit guidance with a validated 32-character request ID while hiding a bidi-interleaved short credential", async () => {
+  const requestId = "req_0123456789abcdef0123456789ab";
+  const detail = "provider failed: acce\u200Ess_token: abc12345";
+  assert.equal(requestId.length, 32);
+  assert.ok(detail.includes("\u200e"));
+  const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+  let responseCalls = 0;
+  let fallbackCalls = 0;
+  const provider = createSiwcResponsesProvider({
+    getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+    fetchImpl: async (input, init) => {
+      responseCalls += 1;
+      assert.equal(String(input), SIWC_RESPONSES_ENDPOINT);
+      assert.equal(init?.method, "POST");
+      return Response.json({ error: {
+        code: "subscription_sharing_usage_limit_exceeded",
+        detail,
+      } }, { status: 429, headers: { "openai-request-id": requestId } });
+    },
+  });
+
+  const exitCode = await runReadonlyCli({
+    cwd: "/synthetic/repository",
+    requestMode: "siwc",
+    model: "synthetic-current-slug",
+    providerLabel: "ChatGPT plan (SIWC)",
+    env: {},
+    inspect: async () => syntheticSnapshot,
+    stdout: output,
+    confirmSend: async () => true,
+    provider,
+    fetchImpl: async () => {
+      fallbackCalls += 1;
+      throw new Error("API-key fallback must not run");
+    },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(responseCalls, 1);
+  assert.equal(fallbackCalls, 0);
+  const finalError = output.value.slice(output.value.lastIndexOf("模型请求未完成："));
+  assert.match(finalError, /HTTP 429/);
+  assert.match(finalError, /error\.code=subscription_sharing_usage_limit_exceeded/);
+  assert.match(finalError, new RegExp(`request ID=${requestId}`));
+  assert.match(finalError, /Pause plan requests/);
+  assert.match(finalError, /review the applicable limit at/);
+  assert.ok(finalError.includes(SIWC_USAGE_URL));
+  assert.doesNotMatch(finalError, /abc12345|access_token|\u200e|错误详情已隐藏/);
+});
+
 test("readonly CLI previews SIWC JSON without API key, sends only after approval, and never falls back", async () => {
   let keyRead = false;
   let modelCalls = 0;
