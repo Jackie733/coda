@@ -1,6 +1,8 @@
 import { createInterface } from "node:readline/promises";
 import { isIP } from "node:net";
 import type { Readable, Writable } from "node:stream";
+import { ApplicationStateMachine, requestAfterApproval, type Provider } from "./application.js";
+import { createOpenAICompatibleProvider, type ModelRequest } from "./model-provider.js";
 import { inspectRepository, type RepositorySnapshot } from "./repo-context.js";
 
 const SYSTEM_PROMPT = [
@@ -57,6 +59,7 @@ export type ReadonlyCliOptions = Readonly<{
   question?: string;
   env?: Environment;
   fetchImpl?: typeof fetch;
+  provider?: Provider<ModelRequest, Response>;
   confirmSend?: () => Promise<boolean>;
   stdout?: Writer;
   stdin?: Reader;
@@ -231,6 +234,7 @@ export async function runReadonlyCli(options: ReadonlyCliOptions = {}): Promise<
   const env = options.env ?? process.env;
   const inspect = options.inspect ?? inspectRepository;
   const cwd = options.cwd ?? process.cwd();
+  const workflow = new ApplicationStateMachine("inspect");
 
   let snapshot: RepositorySnapshot;
   try {
@@ -284,45 +288,35 @@ export async function runReadonlyCli(options: ReadonlyCliOptions = {}): Promise<
   output(stdout, `${serializedBody}\n`);
   output(stdout, "\n默认取消；未明确确认前不会发起任何网络请求。\n");
 
-  let approved = false;
-  try {
-    approved = options.confirmSend
-      ? await options.confirmSend()
-      : await interactiveConsent(options.stdin ?? process.stdin, stdout);
-  } catch (error) {
-    output(stdout, `未发送：无法取得确认（${errorMessage(error)}）。\n`);
+  const provider = options.provider ?? createOpenAICompatibleProvider({ env, fetchImpl: options.fetchImpl });
+  const requestOutcome = await requestAfterApproval(
+    workflow,
+    Object.freeze({ endpoint, serializedBody }),
+    () => options.confirmSend
+      ? options.confirmSend()
+      : interactiveConsent(options.stdin ?? process.stdin, stdout),
+    provider,
+  );
+  if (requestOutcome.kind === "approval-failed") {
+    output(stdout, `未发送：无法取得确认（${errorMessage(requestOutcome.error)}）。\n`);
     return 1;
   }
-  if (!approved) {
+  if (requestOutcome.kind === "cancelled") {
     output(stdout, "已取消；没有发起网络请求。\n");
     return 0;
   }
-
-  // The API credential is read only after explicit consent. It is used only as an Authorization header,
-  // never included in the preview, prompt, logs, repository context, or error output.
-  const apiKey = env.OPENAI_API_KEY;
-  if (!apiKey) {
-    output(stdout, "已确认，但未发送：进程环境中没有 OPENAI_API_KEY。\n");
+  if (requestOutcome.kind === "provider-failed") {
+    output(stdout, `模型请求未完成：${errorMessage(requestOutcome.error)}\n`);
+    return 1;
+  }
+  const response = requestOutcome.response;
+  if (!response.ok) {
+    workflow.fail();
+    output(stdout, `模型请求失败（HTTP ${response.status}）；未执行任何命令，也未修改文件。\n`);
     return 1;
   }
 
-  const fetchImpl = options.fetchImpl ?? fetch;
   try {
-    const response = await fetchImpl(endpoint, {
-      method: "POST",
-      redirect: "error",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: serializedBody,
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!response.ok) {
-      output(stdout, `模型请求失败（HTTP ${response.status}）；未执行任何命令，也未修改文件。\n`);
-      return 1;
-    }
-
     const result: unknown = await response.json().catch(() => null);
     const choices = result && typeof result === "object" && !Array.isArray(result)
       ? (result as Record<string, unknown>).choices
@@ -335,6 +329,7 @@ export async function runReadonlyCli(options: ReadonlyCliOptions = {}): Promise<
       ? (message as Record<string, unknown>).content
       : null;
     if (typeof content !== "string" || !content.trim()) {
+      workflow.fail();
       output(stdout, "模型响应格式无效；未执行任何命令，也未修改文件。\n");
       return 1;
     }
@@ -343,11 +338,13 @@ export async function runReadonlyCli(options: ReadonlyCliOptions = {}): Promise<
     try {
       structured = JSON.parse(content);
     } catch {
+      workflow.fail();
       output(stdout, `\n回答未验证/未完成：模型响应不是有效的结构化 JSON。\n未验证的模型输出：\n${visibleControls(content.trim())}\n`);
       output(stdout, "\n只读模式：本工具不会编辑文件、执行模型建议的命令、提交、推送或创建 PR。\n");
       return 1;
     }
     if (!isRecord(structured) || !Array.isArray(structured.understanding) || !Array.isArray(structured.plan)) {
+      workflow.fail();
       output(stdout, `\n回答未验证/未完成：模型响应缺少 understanding 或 plan 条目数组。\n未验证的模型输出：\n${visibleControls(content.trim())}\n`);
       output(stdout, "\n只读模式：本工具不会编辑文件、执行模型建议的命令、提交、推送或创建 PR。\n");
       return 1;
@@ -366,8 +363,12 @@ export async function runReadonlyCli(options: ReadonlyCliOptions = {}): Promise<
     const hasEntries = understanding.length + plan.length > 0;
     output(stdout, "\n说明：‘已验证’仅表示该条目所列的每个路径和行号都存在于本次上下文，不证明引用在语义上支持该条目。\n");
     output(stdout, "只读模式：本工具不会编辑文件、执行模型建议的命令、提交、推送或创建 PR。\n");
-    return hasEntries && understandingVerified && planVerified ? 0 : 1;
+    const exitCode = hasEntries && understandingVerified && planVerified ? 0 : 1;
+    if (exitCode === 0) workflow.completeInspect();
+    else workflow.fail();
+    return exitCode;
   } catch (error) {
+    workflow.fail();
     output(stdout, `模型请求未完成：${errorMessage(error)}\n`);
     return 1;
   }

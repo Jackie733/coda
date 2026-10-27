@@ -6,6 +6,15 @@ import type { Readable, Writable } from "node:stream";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import {
+  ApplicationStateMachine,
+  approvePatchScope,
+  createApprovedFileScope,
+  requestAfterApproval,
+  type ApprovedFileScope,
+  type Provider,
+} from "./application.js";
+import { createOpenAICompatibleProvider, type ModelRequest } from "./model-provider.js";
 import { endpointFrom, visibleControls } from "./readonly-cli.js";
 import { containsLikelySecret, CONTEXT_LIMITS, isSafeRepositoryPath } from "./repo-context.js";
 
@@ -135,6 +144,7 @@ type PatchCliOptions = Readonly<{
   files?: readonly string[];
   env?: Environment;
   fetchImpl?: typeof fetch;
+  provider?: Provider<ModelRequest, Response>;
   approvePlan?: () => Promise<boolean>;
   confirmSend?: () => Promise<boolean>;
   chooseDisposition?: () => Promise<Disposition | null>;
@@ -527,7 +537,7 @@ async function writeSafeSourceFile(root: string, relativePath: string, expectedO
   }
 }
 
-function validateCitation(value: unknown, approvedFiles: ReadonlySet<string>, originals: ReadonlyMap<string, OriginalFile>): FileEdit["citations"][number] {
+function validateCitation(value: unknown, approvedScope: ApprovedFileScope, originals: ReadonlyMap<string, OriginalFile>): FileEdit["citations"][number] {
   if (!isRecord(value) || !hasExactKeys(value, ["path", "startLine", "endLine"])) throw new Error("补丁引用结构无效。");
   const file = value.path;
   const startLine = value.startLine;
@@ -535,7 +545,7 @@ function validateCitation(value: unknown, approvedFiles: ReadonlySet<string>, or
   if (
     typeof file !== "string" ||
     !isSafeRepositoryPath(file) ||
-    !approvedFiles.has(file) ||
+    !approvedScope.includes(file) ||
     !Number.isSafeInteger(startLine) ||
     !Number.isSafeInteger(endLine)
   ) throw new Error("补丁引用不在已批准的文件范围内或缺少有效行号。");
@@ -548,14 +558,13 @@ function validateCitation(value: unknown, approvedFiles: ReadonlySet<string>, or
 
 function validatePatchResponse(
   value: unknown,
-  approvedFiles: readonly string[],
+  approvedScope: ApprovedFileScope,
   originals: ReadonlyMap<string, OriginalFile>,
 ): readonly ValidatedPatch[] {
   if (!isRecord(value) || !hasExactKeys(value, ["patches"]) || !Array.isArray(value.patches)) {
     throw new Error("模型响应必须是包含 patches 数组的结构化 JSON。");
   }
-  if (value.patches.length > approvedFiles.length) throw new Error("补丁项数量超出批准文件数。");
-  const approvedSet = new Set(approvedFiles);
+  if (value.patches.length > approvedScope.files.length) throw new Error("补丁项数量超出批准文件数。");
   const changed = new Set<string>();
   let totalEdits = 0;
   const validated: ValidatedPatch[] = [];
@@ -567,7 +576,7 @@ function validatePatchResponse(
     const file = item.path;
     if (
       !isSafeRepositoryPath(file) ||
-      !approvedSet.has(file) ||
+      !approvedScope.includes(file) ||
       changed.has(file) ||
       !originals.has(file)
     ) throw new Error(`补丁目标不在用户明确批准的文件范围内：${visibleControls(file)}`);
@@ -592,7 +601,7 @@ function validatePatchResponse(
         DISALLOWED_SOURCE_CONTROLS.test(newText) ||
         DISALLOWED_OUTPUT_CONTROLS.test(reason)
       ) throw new Error(`编辑内容、理由或引用无效：${visibleControls(file)}`);
-      const safeCitations = citations.map((citation) => validateCitation(citation, approvedSet, originals));
+      const safeCitations = citations.map((citation) => validateCitation(citation, approvedScope, originals));
       edits.push({ oldText, newText, reason, citations: safeCitations });
     }
     validated.push({ path: file, edits: Object.freeze(edits) });
@@ -781,10 +790,14 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
   const stdout = options.stdout ?? process.stdout;
   const env = options.env ?? process.env;
   const cwd = options.cwd ?? process.cwd();
+  const workflow = new ApplicationStateMachine("patch");
   let request: { plan: string; files: readonly string[] };
+  let approvedScope: ApprovedFileScope;
   try {
     request = assertPlanAndFiles(options.plan, options.files);
+    approvedScope = createApprovedFileScope(request.files);
   } catch (error) {
+    workflow.fail();
     output(stdout, `未启动补丁流程：${errorMessage(error)}\n`);
     output(stdout, "原始工作树未被修改；未创建隔离工作树。\n");
     return 2;
@@ -798,7 +811,7 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
     const baseCommit = (await runGit(["rev-parse", "--verify", "HEAD^{commit}"], repositoryRoot, 64 * 1024)).trim();
     if (!/^[0-9a-f]{40,64}$/i.test(baseCommit)) throw new Error("无法解析有效的 HEAD 提交；未创建补丁工作树。");
     const disabledFilters = await disabledFilterConfiguration(repositoryRoot);
-    for (const file of request.files) {
+    for (const file of approvedScope.files) {
       try {
         const treeEntries = (await runGit(
           ["ls-tree", "-r", "-z", "--full-tree", baseCommit, "--", file],
@@ -825,19 +838,17 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
     output(stdout, `仓库：${JSON.stringify(repositoryRoot)}\n`);
     output(stdout, `所选基准：HEAD ${baseCommit}\n`);
     output(stdout, `待批准具体计划：${visibleControls(request.plan)}\n`);
-    output(stdout, `待批准精确文件范围：${request.files.map((file) => visibleControls(file)).join("；")}\n`);
+    output(stdout, `待批准精确文件范围：${approvedScope.files.map((file) => visibleControls(file)).join("；")}\n`);
     output(stdout, "基准仅为上述 HEAD；批准仅用于在临时目录生成本地候选补丁，此阶段不会发送网络请求。源工作树文件、索引及 staged/unstaged/untracked 改动不复制、不修改；Git 只登记隔离 linked-worktree 的管理元数据，临时目录只物化这些批准路径。\n");
 
-    let planApproved = false;
-    try {
-      planApproved = options.approvePlan
-        ? await options.approvePlan()
-        : await interactivePlanApproval(options.stdin ?? process.stdin, stdout);
-    } catch (error) {
-      output(stdout, `未取得计划/文件批准；没有创建隔离工作树或发送请求：${errorMessage(error)}\n`);
+    const scopeOutcome = await approvePatchScope(workflow, () => options.approvePlan
+      ? options.approvePlan()
+      : interactivePlanApproval(options.stdin ?? process.stdin, stdout));
+    if (scopeOutcome.kind === "approval-failed") {
+      output(stdout, `未取得计划/文件批准；没有创建隔离工作树或发送请求：${errorMessage(scopeOutcome.error)}\n`);
       return 1;
     }
-    if (!planApproved) {
+    if (scopeOutcome.kind === "cancelled") {
       output(stdout, "已取消：计划或文件范围未批准；没有创建隔离工作树或发送请求。\n");
       output(stdout, "源工作树文件、索引和已有改动未被更改。\n");
       return 0;
@@ -845,15 +856,17 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
     output(stdout, "计划与精确文件范围已批准；现在创建仅物化这些路径的隔离工作树。\n");
 
     owned = await allocateOwnedWorktree(repositoryRoot, baseCommit, disabledFilters);
-    await initializeOwnedWorktree(owned, request.files);
+    await initializeOwnedWorktree(owned, approvedScope.files);
 
     const approvedFiles: string[] = [];
     const originals = new Map<string, OriginalFile>();
-    for (const file of request.files) {
+    for (const file of approvedScope.files) {
       const canonical = await canonicalSafeFile(owned.worktreePath, file);
       const canonicalRoot = await realpath(owned.worktreePath);
       const canonicalRelative = path.relative(canonicalRoot, canonical).split(path.sep).join("/");
-      if (canonicalRelative !== file) throw new Error(`文件规范化后偏离批准范围：${visibleControls(file)}`);
+      if (canonicalRelative !== file || !approvedScope.includes(canonicalRelative)) {
+        throw new Error(`文件规范化后偏离批准范围：${visibleControls(file)}`);
+      }
       const content = await readSafeSourceFile(owned.worktreePath, canonicalRelative);
       approvedFiles.push(canonicalRelative);
       originals.set(canonicalRelative, { content, lineCount: lineCount(content) });
@@ -883,39 +896,31 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
     output(stdout, `${serializedBody}\n`);
     output(stdout, "\n默认取消。发送确认仅授权向已披露的服务目标原样发送这份完整请求一次，不会扩大已批准的计划或文件范围。\n");
 
-    let approved = false;
-    try {
-      approved = options.confirmSend
-        ? await options.confirmSend()
-        : await interactiveConsent(options.stdin ?? process.stdin, stdout);
-    } catch (error) {
-      output(stdout, `未发送：无法取得确认（${errorMessage(error)}）。\n`);
+    const provider = options.provider ?? createOpenAICompatibleProvider({ env, fetchImpl: options.fetchImpl });
+    const requestOutcome = await requestAfterApproval(
+      workflow,
+      Object.freeze({ endpoint, serializedBody }),
+      () => options.confirmSend
+        ? options.confirmSend()
+        : interactiveConsent(options.stdin ?? process.stdin, stdout),
+      provider,
+    );
+    if (requestOutcome.kind === "approval-failed") {
+      output(stdout, `未发送：无法取得确认（${errorMessage(requestOutcome.error)}）。\n`);
       const cleanup = await discardOwnedWorktree(owned, options.cleanupOperations);
       reportWorktreeState(stdout, cleanup, owned, "已清理");
       owned = null;
       return 1;
     }
-    if (!approved) {
+    if (requestOutcome.kind === "cancelled") {
       output(stdout, "已取消：未发送模型请求，也未应用补丁。\n");
       const cleanup = await discardOwnedWorktree(owned, options.cleanupOperations);
       reportWorktreeState(stdout, cleanup, owned, "已丢弃");
       owned = null;
       return cleanup.complete ? 0 : 1;
     }
-
-    const apiKey = env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("已确认，但未发送：进程环境中没有 OPENAI_API_KEY。");
-    const fetchImpl = options.fetchImpl ?? fetch;
-    const response = await fetchImpl(endpoint, {
-      method: "POST",
-      redirect: "error",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: serializedBody,
-      signal: AbortSignal.timeout(30_000),
-    });
+    if (requestOutcome.kind === "provider-failed") throw requestOutcome.error;
+    const response = requestOutcome.response;
     if (!response.ok) throw new Error(`模型请求失败（HTTP ${response.status}）；未应用补丁。`);
     const result = await readBoundedResponseJson(response);
     const content = parseModelContent(result);
@@ -928,7 +933,7 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
     } catch {
       throw new Error("模型响应不是有效 JSON；未应用补丁。");
     }
-    const patches = validatePatchResponse(structured, approvedFiles, originals);
+    const patches = validatePatchResponse(structured, approvedScope, originals);
     if (patches.length === 0) throw new Error("模型未建议可安全应用的补丁；未修改文件。");
     const updatedFiles = new Map<string, string>();
     for (const patch of patches) {
@@ -951,10 +956,12 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
       [...owned.disabledFilters, "core.sparseCheckout=false"],
     );
     if (!diff.trim()) throw new Error("应用后没有可审查的差异；未将结果标记为成功。");
+    workflow.candidateReady();
     output(stdout, "\n以下是候选补丁在隔离工作树中相对基准 HEAD 的完整 diff；尚未决定保留或丢弃：\n");
     output(stdout, `${renderDiffForTerminal(diff)}\n`);
     renderPatchNotes(patches, stdout);
     output(stdout, "\n每个补丁项均携带结构化引用；引用只证明路径与行号结构有效，不证明语义支持编辑。\n");
+    workflow.reviewDiff();
 
     let disposition: Disposition | null;
     try {
@@ -965,6 +972,7 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
       output(stdout, `未保留补丁：无法取得保留/丢弃选择（${errorMessage(error)}）。\n`);
       const cleanup = await discardOwnedWorktree(owned, options.cleanupOperations);
       reportWorktreeState(stdout, cleanup, owned, "已丢弃");
+      workflow.fail();
       owned = null;
       return 1;
     }
@@ -974,6 +982,7 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
     }
 
     if (disposition === "keep") {
+      workflow.finishPatch("kept");
       output(stdout, `已生成并保留隔离工作树（未提交）：${visibleControls(owned.worktreePath)}\n`);
       output(stdout, "源工作树文件、索引和已有改动未被更改；没有执行模型生成命令、提交、推送、创建 PR 或合并。\n");
       owned = null;
@@ -986,9 +995,12 @@ export async function runPatchCli(options: PatchCliOptions = {}): Promise<number
     else if (!cleanup.complete) output(stdout, "补丁工作树已移除，但临时父目录仍待清理。\n");
     else output(stdout, "已生成后丢弃隔离补丁工作树。\n");
     reportWorktreeState(stdout, cleanup, owned, cleanup.complete ? "已丢弃" : "清理未完成");
+    if (cleanup.complete) workflow.finishPatch(disposition === null ? "cancelled" : "discarded");
+    else workflow.fail();
     owned = null;
     return disposition === null || !cleanup.complete ? 1 : 0;
   } catch (error) {
+    workflow.fail();
     output(stdout, `补丁流程失败；未声称成功，源工作树文件、索引和已有改动未被更改：${errorMessage(error)}\n`);
     if (!owned) {
       output(stdout, "隔离工作树状态：未创建或已清理。\n");
