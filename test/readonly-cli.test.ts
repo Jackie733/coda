@@ -233,6 +233,38 @@ test("explicit consent sends exactly the complete immutable payload shown in pre
   });
 });
 
+test("inspect CLI accepts a replacement provider without changing approval or payload preview policy", async () => {
+  await withRepository(async (root) => {
+    const output = captureOutput();
+    let providerCalls = 0;
+    let deliveredRequest: { endpoint: string; serializedBody: string } | undefined;
+    const responseContent = JSON.stringify({
+      understanding: [{ text: "提供问候函数。", citations: [{ path: "src/main.ts", startLine: 1, endLine: 3 }] }],
+      plan: [{ text: "核对 README。", citations: [{ path: "README.md", startLine: 1, endLine: 2 }] }],
+    });
+    const exitCode = await runReadonlyCli({
+      cwd: root,
+      env: { OPENAI_MODEL: "replacement-model", OPENAI_BASE_URL: "https://provider.example/v1" },
+      stdout: output.writer,
+      confirmSend: async () => true,
+      provider: {
+        send: async (request) => {
+          providerCalls += 1;
+          deliveredRequest = request;
+          return Response.json({ choices: [{ message: { role: "assistant", content: responseContent } }] });
+        },
+      },
+      fetchImpl: async () => { throw new Error("the OpenAI-compatible adapter must not be called"); },
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(providerCalls, 1);
+    assert.equal(deliveredRequest?.endpoint, "https://provider.example/v1/chat/completions");
+    assert.ok(output.text.includes(deliveredRequest?.serializedBody ?? ""));
+    assert.match(output.text, /已验证（引用结构）/);
+  });
+});
+
 test("unstructured model responses are marked unverified", async () => {
   await withRepository(async (root) => {
     for (const content of [

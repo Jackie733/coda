@@ -574,6 +574,43 @@ test("unexpected disposition values fail closed instead of being treated as disc
   });
 });
 
+test("patch CLI accepts a replacement provider while retaining exact preview, scope, and disposition gates", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const output = captureOutput();
+    let providerCalls = 0;
+    let fetchCalls = 0;
+    let deliveredRequest: { endpoint: string; serializedBody: string } | undefined;
+    const exitCode = await runPatchCli({
+      cwd: root,
+      plan: "只更新 greeting 的返回值。",
+      files: ["src/main.ts"],
+      env: { OPENAI_MODEL: "replacement-model", OPENAI_BASE_URL: "https://provider.example/v1" },
+      stdout: output.writer,
+      approvePlan: async () => true,
+      confirmSend: async () => true,
+      chooseDisposition: async () => "discard",
+      provider: {
+        send: async (request) => {
+          providerCalls += 1;
+          deliveredRequest = request;
+          return mockResponse(patchContent());
+        },
+      },
+      fetchImpl: async () => { fetchCalls += 1; throw new Error("the OpenAI-compatible adapter must not be called"); },
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(providerCalls, 1);
+    assert.equal(fetchCalls, 0);
+    assert.equal(deliveredRequest?.endpoint, "https://provider.example/v1/chat/completions");
+    assert.ok(output.text.includes(deliveredRequest?.serializedBody ?? ""));
+    assert.match(output.text, /候选补丁在隔离工作树中相对基准 HEAD 的完整 diff/);
+    assert.match(output.text, /已生成后丢弃隔离补丁工作树/);
+    assert.deepEqual(await originState(root), before);
+  });
+});
+
 test("malformed model patches fail closed and preserve origin state", async () => {
   await withDirtyRepository(async ({ root }) => {
     const before = await originState(root);
