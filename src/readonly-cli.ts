@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline/promises";
+import { isIP } from "node:net";
 import type { Readable, Writable } from "node:stream";
 import { inspectRepository, type RepositorySnapshot } from "./repo-context.js";
 
@@ -55,6 +56,16 @@ export function endpointFrom(baseUrl: string): string {
   ) {
     throw new Error("OPENAI_BASE_URL must be an HTTP(S) base URL without credentials, query, or fragment.");
   }
+  if (parsed.protocol === "http:") {
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const ipv4Octets = isIP(hostname) === 4 ? hostname.split(".").map(Number) : [];
+    const isLoopback = hostname === "localhost" ||
+      (ipv4Octets.length === 4 && ipv4Octets[0] === 127) ||
+      (isIP(hostname) === 6 && hostname === "::1");
+    if (!isLoopback) {
+      throw new Error("OPENAI_BASE_URL must use HTTPS, except HTTP is allowed only for localhost or loopback IP addresses.");
+    }
+  }
   parsed.pathname = `${parsed.pathname.replace(/\/+$/, "")}/chat/completions`;
   return parsed.toString();
 }
@@ -79,6 +90,35 @@ function errorMessage(error: unknown): string {
 
 function repoStatusLabel(snapshot: RepositorySnapshot): string {
   return snapshot.worktree === "clean" ? "干净" : "有未提交改动（不显示路径名）";
+}
+
+const FILE_LINE_CITATION = /(?:^|[^A-Za-z0-9_.-])((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9_-]+):(\d+)(?:-(\d+))?/g;
+
+function validateCitations(content: string, snapshot: RepositorySnapshot): string | null {
+  const lineCounts = new Map<string, number>();
+  for (const relativePath of snapshot.includedFiles) {
+    const header = `File ${JSON.stringify(relativePath)}\n`;
+    const headerStart = snapshot.context.indexOf(header);
+    if (headerStart < 0) continue;
+    const contentStart = headerStart + header.length;
+    const nextFile = snapshot.context.indexOf("\n\nFile ", contentStart);
+    const fileContent = snapshot.context.slice(contentStart, nextFile < 0 ? undefined : nextFile);
+    lineCounts.set(relativePath, fileContent.split("\n").length);
+  }
+
+  const citations = [...content.matchAll(FILE_LINE_CITATION)];
+  if (citations.length === 0) return "未发现可验证的文件/行号引用";
+  for (const citation of citations) {
+    const relativePath = citation[1];
+    const firstLine = Number(citation[2]);
+    const lastLine = Number(citation[3] ?? citation[2]);
+    const lineCount = lineCounts.get(relativePath);
+    if (lineCount === undefined) return `引用的文件不在本次上下文中：${relativePath}`;
+    if (firstLine < 1 || lastLine < firstLine || lastLine > lineCount) {
+      return `引用的行号不在本次上下文范围内：${relativePath}:${citation[2]}${citation[3] ? `-${citation[3]}` : ""}`;
+    }
+  }
+  return null;
 }
 
 export async function runReadonlyCli(options: ReadonlyCliOptions = {}): Promise<number> {
@@ -190,7 +230,15 @@ export async function runReadonlyCli(options: ReadonlyCliOptions = {}): Promise<
       return 1;
     }
 
-    output(stdout, "\n模型理解与短计划（只读建议；请核对文件/行号）：\n");
+    const citationError = validateCitations(content, snapshot);
+    if (citationError) {
+      output(stdout, `\n回答未验证/未完成：${citationError}；模型文本不代表已完成理解或计划。\n`);
+      output(stdout, `未验证的模型文本：\n${content.trim()}\n`);
+      output(stdout, "\n只读模式：本工具不会编辑文件、执行模型建议的命令、提交、推送或创建 PR。\n");
+      return 1;
+    }
+
+    output(stdout, "\n模型理解与短计划（只读建议；引用路径和行号已核对为本次上下文中的有效引用）：\n");
     output(stdout, `${content.trim()}\n`);
     output(stdout, "\n只读模式：本工具不会编辑文件、执行模型建议的命令、提交、推送或创建 PR。\n");
     return 0;

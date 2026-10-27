@@ -26,6 +26,7 @@ async function createSyntheticRepository(): Promise<string> {
   await writeFile(path.join(root, "README.md"), "# Synthetic fixture\nFixture-only documentation.\n");
   await writeFile(path.join(root, "package.json"), '{"name":"fixture-only"}\n');
   await writeFile(path.join(root, "src", "main.ts"), "export function greeting() {\n  return 'fixture-only';\n}\n");
+  await writeFile(path.join(root, "src", "config.ts"), 'const password = "hunter2";\nexport const apiKey = "short-test-key";\n');
   await writeFile(path.join(root, "src", ".env-cache", "leak.ts"), "export const hidden = 'env-directory-secret';\n");
   await writeFile(path.join(root, "src", ".aws", "credentials.ts"), "export const hidden = 'credential-directory-secret';\n");
   await writeFile(path.join(root, "src", "nested-safe", "child.ts"), "export const nested = 'in-repo-before-link';\n");
@@ -72,8 +73,14 @@ function captureOutput() {
 
 test("model endpoint preview uses a normalized URL and rejects unsafe destinations", () => {
   assert.equal(endpointFrom("https://MOCK.example:443/v1/"), "https://mock.example/v1/chat/completions");
-  assert.equal(endpointFrom("http://mock.example:80"), "http://mock.example/chat/completions");
+  assert.equal(endpointFrom("http://localhost:8080/v1"), "http://localhost:8080/v1/chat/completions");
+  assert.equal(endpointFrom("http://127.0.0.1:8080/v1"), "http://127.0.0.1:8080/v1/chat/completions");
+  assert.equal(endpointFrom("http://127.42.0.9/v1"), "http://127.42.0.9/v1/chat/completions");
+  assert.equal(endpointFrom("http://[::1]:8080/v1"), "http://[::1]:8080/v1/chat/completions");
   for (const baseUrl of [
+    "http://model.example/v1",
+    "http://192.168.1.10/v1",
+    "http://localhost.example/v1",
     "https://mock.example/v1/../admin",
     "https://mock.example/%2e%2e/admin",
     "https://mock.example/v1?route=other",
@@ -100,6 +107,9 @@ test("repository inspection reports Git metadata and only bounded safe tracked t
     assert.ok(!snapshot.context.includes("never-include-this"));
     assert.ok(!snapshot.context.includes("env-directory-secret"));
     assert.ok(!snapshot.context.includes("credential-directory-secret"));
+    assert.ok(!snapshot.includedFiles.includes("src/config.ts"));
+    assert.ok(!snapshot.context.includes("hunter2"));
+    assert.ok(!snapshot.context.includes("short-test-key"));
     assert.ok(!snapshot.context.includes("outsideSecret"));
     assert.ok(!snapshot.context.includes("dependency"));
     assert.ok(!snapshot.context.includes("built"));
@@ -199,6 +209,53 @@ test("explicit consent sends exactly the complete immutable payload shown in pre
     assert.ok(!sentBody.includes(key), "credentials must never appear in the payload");
     assert.match(output.text, /src\/main\.ts:1-3/);
     assert.match(output.text, /不会编辑文件/);
+  });
+});
+
+test("model answers without citations or with out-of-context citations are marked unverified", async () => {
+  await withRepository(async (root) => {
+    for (const content of [
+      "理解：代码提供问候函数。计划：检查调用者。",
+      "理解：代码提供问候函数。依据 `src/not-in-context.ts:1`。",
+      "理解：代码提供问候函数。依据 `src/main.ts:99`。",
+    ]) {
+      const output = captureOutput();
+      const exitCode = await runReadonlyCli({
+        cwd: root,
+        env: { OPENAI_API_KEY: "mock-only-key", OPENAI_BASE_URL: "https://mock.example/v1" },
+        stdout: output.writer,
+        confirmSend: async () => true,
+        fetchImpl: async () => Response.json({ choices: [{ message: { role: "assistant", content } }] }),
+      });
+
+      assert.equal(exitCode, 1, content);
+      assert.match(output.text, /回答未验证\/未完成/);
+      assert.doesNotMatch(output.text, /引用路径和行号已核对/);
+      assert.doesNotMatch(output.text, /模型理解与短计划/);
+      assert.match(output.text, /未验证的模型文本/);
+    }
+  });
+});
+
+test("remote HTTP endpoint is rejected before consent or any network request", async () => {
+  await withRepository(async (root) => {
+    let fetchCount = 0;
+    const output = captureOutput();
+    const exitCode = await runReadonlyCli({
+      cwd: root,
+      env: { OPENAI_API_KEY: "must-not-be-read", OPENAI_BASE_URL: "http://model.example/v1" },
+      stdout: output.writer,
+      confirmSend: async () => { throw new Error("consent must not be requested for an invalid destination"); },
+      fetchImpl: async () => {
+        fetchCount += 1;
+        throw new Error("must not send to a remote HTTP endpoint");
+      },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(fetchCount, 0);
+    assert.match(output.text, /服务目标配置无效/);
+    assert.doesNotMatch(output.text, /Bearer|must-not-be-read/);
   });
 });
 
