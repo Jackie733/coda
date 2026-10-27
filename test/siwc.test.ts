@@ -1462,6 +1462,93 @@ test("usage-limit stream errors never become success and point to shared plan us
   });
 });
 
+test("SSE terminal failures expose only whitelisted structured diagnostics", async () => {
+  const requestId = "req_0123456789abcdef0123456789ab";
+  const secret = "synthetic-access-token-never-log";
+  const rawMessage = `private provider message ${secret}`;
+  const rawDetail = "unfiltered provider detail must not be echoed";
+  const cases = [
+    {
+      eventType: "response.failed",
+      response: {
+        status: "failed",
+        error: { code: "subscription_sharing_usage_limit_exceeded", param: "service_tier", message: rawMessage, detail: rawDetail },
+      },
+      code: "subscription_sharing_usage_limit_exceeded",
+      param: "service_tier",
+      reason: null,
+      showsUsageUrl: true,
+    },
+    {
+      eventType: "response.incomplete",
+      response: {
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        error: { code: "unsupported_parameter", param: "max_output_tokens", message: rawMessage, detail: rawDetail },
+      },
+      code: "unsupported_parameter",
+      param: "max_output_tokens",
+      reason: "max_output_tokens",
+      showsUsageUrl: false,
+    },
+    {
+      eventType: "response.incomplete",
+      response: {
+        status: "incomplete",
+        incomplete_details: { reason: "synthetic-private-reason" },
+        error: { code: "synthetic-secret-code-never-log", param: "credential_payload", message: rawMessage, detail: rawDetail },
+      },
+      code: null,
+      param: null,
+      reason: null,
+      showsUsageUrl: false,
+    },
+  ] as const;
+
+  for (const item of cases) {
+    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    let fallbackCalls = 0;
+    const provider = createSiwcResponsesProvider({
+      getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+      fetchImpl: async () => new Response(sseEvent(item.eventType, { response: item.response }), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream", "openai-request-id": requestId },
+      }),
+    });
+    const exitCode = await runReadonlyCli({
+      cwd: "/synthetic/repository",
+      requestMode: "siwc",
+      model: "synthetic-current-slug",
+      providerLabel: "ChatGPT plan (SIWC)",
+      env: {},
+      inspect: async () => syntheticSnapshot,
+      stdout: output,
+      confirmSend: async () => true,
+      provider,
+      fetchImpl: async () => {
+        fallbackCalls += 1;
+        throw new Error("API-key fallback must not run");
+      },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(fallbackCalls, 0);
+    const finalError = output.value.slice(output.value.lastIndexOf("模型请求未完成："));
+    assert.match(finalError, /HTTP 200/);
+    assert.match(finalError, new RegExp(`SSE event=${item.eventType.replace(".", "\\.")}`));
+    assert.match(finalError, /response body shape=object/);
+    assert.match(finalError, new RegExp(`request ID=${requestId}`));
+    if (item.code) assert.match(finalError, new RegExp(`error\\.code=${item.code}`));
+    else assert.doesNotMatch(finalError, /error\.code=/);
+    if (item.param) assert.match(finalError, new RegExp(`error\\.param=${item.param.replace(".", "\\.")}`));
+    else assert.doesNotMatch(finalError, /error\.param=/);
+    if (item.reason) assert.match(finalError, new RegExp(`incomplete_details\\.reason=${item.reason}`));
+    else assert.doesNotMatch(finalError, /incomplete_details\.reason=/);
+    if (item.showsUsageUrl) assert.ok(finalError.includes(SIWC_USAGE_URL));
+    assert.doesNotMatch(finalError, /synthetic-access-token-never-log|private provider message|unfiltered provider detail|synthetic-secret-code-never-log|credential_payload|synthetic-private-reason/);
+  }
+});
+
 test("a stream without response.completed fails and direct-admission detail text is filtered and kept separate from stable codes", async () => {
   const interrupted = createSiwcResponsesProvider({
     getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
@@ -1489,9 +1576,9 @@ test("a stream without response.completed fails and direct-admission detail text
     { status: 401, requestId: "synthetic-admission-detail-code", detailText: "invalid_grant", expectedDetail: "invalid_grant" },
     { status: 403, requestId: "synthetic-admission-control", detailText: "policy\ndenied", expectedDetail: "policy denied" },
     { status: 403, requestId: "synthetic-admission-bidi", detailText: `safe-before ${String.fromCodePoint(0x202e)} spoofed-after ${String.fromCodePoint(0x2066)} left ${String.fromCodePoint(0x2067)} right ${String.fromCodePoint(0x2068)} first ${String.fromCodePoint(0x2069)} done`, expectedDetail: "safe-before \\u202E spoofed-after \\u2066 left \\u2067 right \\u2068 first \\u2069 done" },
-    { status: 403, requestId: "synthetic-admission-bidi-secret", detailText: `synthetic access${String.fromCodePoint(0x202e)}_token must-not-display`, expectedDetail: null },
+    { status: 403, requestId: "synthetic-admission-bidi-sensitive", detailText: `synthetic access${String.fromCodePoint(0x202e)}_token must-not-display`, expectedDetail: null },
     { status: 403, requestId: "req-short", detailText: "provider failed: acce\u200Ess_token: abc12345", expectedDetail: null },
-    { status: 403, requestId: "synthetic-admission-bidi-long-token", detailText: `abcdefghijklmnop${String.fromCodePoint(0x202e)}qrstuvwxyzABCDEF`, expectedDetail: null },
+    { status: 403, requestId: "synthetic-admission-bidi-long", detailText: `abcdefghijklmnop${String.fromCodePoint(0x202e)}qrstuvwxyzABCDEF`, expectedDetail: null },
     { status: 403, requestId: "synthetic-admission-bidi-url", detailText: `https:${String.fromCodePoint(0x202e)}//synthetic.example/credential`, expectedDetail: null },
     { status: 403, requestId: "synthetic-admission-length", detailText: "diagnostic text ".repeat(30), expectedDetail: `${"diagnostic text ".repeat(30).slice(0, 239)}…` },
   ];
@@ -1623,6 +1710,62 @@ test("readonly CLI preserves usage-limit guidance with a validated 32-character 
   assert.match(finalError, /review the applicable limit at/);
   assert.ok(finalError.includes(SIWC_USAGE_URL));
   assert.doesNotMatch(finalError, /abc12345|access_token|\u200e|错误详情已隐藏/);
+});
+
+test("readonly CLI rejects secret-like request ID headers without hiding mapped recovery guidance", async () => {
+  const maliciousRequestIds = [
+    "synthetic-access-token-never-log",
+    "sk-proj-syntheticsecret1234567890",
+    "Bearer-secretvalue0123456789abcdef",
+    "token-secretvalue0123456789abcdef",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature_12345678",
+    "req_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature_12345678",
+    "0123456789abcdef0123456789abcdef",
+  ];
+  const detail = "provider failed: acce\u200Ess_token: abc12345";
+  for (const requestId of maliciousRequestIds) {
+    const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
+    let responseCalls = 0;
+    let fallbackCalls = 0;
+    const provider = createSiwcResponsesProvider({
+      getAccessToken: async () => CALLBACK_ACCESS_TOKEN,
+      fetchImpl: async (input, init) => {
+        responseCalls += 1;
+        assert.equal(String(input), SIWC_RESPONSES_ENDPOINT);
+        assert.equal(init?.method, "POST");
+        return Response.json({ error: {
+          code: "subscription_sharing_usage_limit_exceeded",
+          detail,
+        } }, { status: 429, headers: { "openai-request-id": requestId } });
+      },
+    });
+    const exitCode = await runReadonlyCli({
+      cwd: "/synthetic/repository",
+      requestMode: "siwc",
+      model: "synthetic-current-slug",
+      providerLabel: "ChatGPT plan (SIWC)",
+      env: {},
+      inspect: async () => syntheticSnapshot,
+      stdout: output,
+      confirmSend: async () => true,
+      provider,
+      fetchImpl: async () => {
+        fallbackCalls += 1;
+        throw new Error("API-key fallback must not run");
+      },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(responseCalls, 1);
+    assert.equal(fallbackCalls, 0);
+    assert.ok(!output.value.includes(requestId));
+    const finalError = output.value.slice(output.value.lastIndexOf("模型请求未完成："));
+    assert.match(finalError, /HTTP 429/);
+    assert.match(finalError, /error\.code=subscription_sharing_usage_limit_exceeded/);
+    assert.match(finalError, /Pause plan requests/);
+    assert.ok(finalError.includes(SIWC_USAGE_URL));
+    assert.doesNotMatch(finalError, /abc12345|access_token|\u200e|API-key fallback must not run/);
+  }
 });
 
 test("readonly CLI previews SIWC JSON without API key, sends only after approval, and never falls back", async () => {

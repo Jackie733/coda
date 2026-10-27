@@ -21,9 +21,29 @@ const PUBLIC_SIWC_ERROR_CODES = new Set([
   "unsupported_capability",
   "unsupported_value",
 ]);
+const PUBLIC_STREAM_ERROR_PARAMS = new Set([
+  "model",
+  "input",
+  "instructions",
+  "text",
+  "text.format",
+  "tools",
+  "tools.execution",
+  "store",
+  "stream",
+  "service_tier",
+  "previous_response_id",
+  "max_output_tokens",
+  "temperature",
+  "top_p",
+  "tool_choice",
+  "reasoning.effort",
+]);
+const PUBLIC_INCOMPLETE_REASONS = new Set(["max_output_tokens", "content_filter"]);
 
 export type SiwcModel = Readonly<{ slug: string; displayName: string }>;
 export type ResponseBodyShape = "error-object" | "detail-object" | "object" | "array" | "scalar" | "empty" | "unreadable";
+type TerminalStreamEventType = "response.failed" | "response.incomplete" | "error";
 
 export class SiwcProviderError extends Error {
   readonly status: number | null;
@@ -32,6 +52,8 @@ export class SiwcProviderError extends Error {
   readonly detail: string | null;
   readonly requestId: string | null;
   readonly bodyShape: ResponseBodyShape | null;
+  readonly eventType: TerminalStreamEventType | null;
+  readonly incompleteReason: string | null;
   constructor(input: Readonly<{
     message: string;
     status?: number | null;
@@ -40,6 +62,8 @@ export class SiwcProviderError extends Error {
     detail?: string | null;
     requestId?: string | null;
     bodyShape?: ResponseBodyShape | null;
+    eventType?: TerminalStreamEventType | null;
+    incompleteReason?: string | null;
   }>) {
     super(input.message);
     this.name = "SiwcProviderError";
@@ -49,15 +73,19 @@ export class SiwcProviderError extends Error {
     this.detail = input.detail ?? null;
     this.requestId = input.requestId ?? null;
     this.bodyShape = input.bodyShape ?? null;
+    this.eventType = input.eventType ?? null;
+    this.incompleteReason = input.incompleteReason ?? null;
   }
 
   toUserMessage(): string {
     const details = [
       this.status === null ? null : `HTTP ${this.status}`,
+      this.eventType ? `SSE event=${this.eventType}` : null,
       this.code ? `error.code=${this.code}` : null,
       this.param ? `error.param=${this.param}` : null,
       this.detail ? `diagnostic detail=${JSON.stringify(this.detail)}` : null,
       this.bodyShape ? `response body shape=${this.bodyShape}` : null,
+      this.incompleteReason ? `incomplete_details.reason=${this.incompleteReason}` : null,
       this.requestId ? `request ID=${this.requestId}` : null,
     ].filter(Boolean);
     return `${this.message}${details.length ? `\n诊断信息：${details.join("；")}` : ""}`;
@@ -82,7 +110,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isSafeRequestId(value: string): boolean {
-  return /^[A-Za-z0-9._:-]{1,128}$/.test(value);
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(value)) return false;
+  if (/(?:^|[._:-])(?:sk(?:[-_]|$)|sess(?:[-_]|$)|whsec_|github_pat_|gh[pousr]_|xox[baprs]-)/i.test(value)) return false;
+  if (/^(?:bearer|token|access[_-]?token|refresh[_-]?token|id[_-]?token)/i.test(value)) return false;
+  if (/(?:^|[._:-])(?:bearer|token|jwt|secret|credential|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|authorization[_-]?code|code[_-]?verifier|password)(?:$|[._:-])/i.test(value)) return false;
+  if (!/^req_/i.test(value) && /[A-Za-z0-9]{24,}/.test(value)) return false;
+  const jwtCandidate = value.replace(/^req_/i, "");
+  if (/^eyJ[A-Za-z0-9_-]{8,}\./.test(jwtCandidate) || /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/.test(jwtCandidate)) return false;
+  return true;
 }
 
 function safeRequestId(headers: Headers): string | null {
@@ -242,11 +277,32 @@ function eventText(body: Record<string, unknown>): string {
   return parts.join("");
 }
 
-function streamFailure(body: Record<string, unknown>, requestId: string | null, status = 200): SiwcProviderError {
-  const { code, param, detail } = errorDetails(body);
+function safeIncompleteReason(body: Record<string, unknown>): string | null {
+  const response = isRecord(body.response) ? body.response : null;
+  const details = response && isRecord(response.incomplete_details)
+    ? response.incomplete_details
+    : isRecord(body.incomplete_details) ? body.incomplete_details : null;
+  const reason = details?.reason;
+  return typeof reason === "string" && PUBLIC_INCOMPLETE_REASONS.has(reason) ? reason : null;
+}
+
+function streamFailure(eventType: TerminalStreamEventType, body: Record<string, unknown>, requestId: string | null, status = 200): SiwcProviderError {
+  const extracted = errorDetails(body);
+  const code = extracted.code && PUBLIC_SIWC_ERROR_CODES.has(extracted.code) ? extracted.code : null;
+  const param = extracted.param && PUBLIC_STREAM_ERROR_PARAMS.has(extracted.param) ? extracted.param : null;
+  const incompleteReason = eventType === "response.incomplete" ? safeIncompleteReason(body) : null;
   const message = messageForCode(code, param, status) ??
-    `SIWC Responses stream ended with ${body.type === "response.incomplete" ? "response.incomplete" : "a provider error"}${code ? ` (${code})` : ""}${param ? ` for parameter ${param}` : ""}; no API-key fallback was used.`;
-  return new SiwcProviderError({ message, status, code, param, detail, requestId });
+    `SIWC Responses stream ended with ${eventType}; no API-key fallback was used.`;
+  return new SiwcProviderError({
+    message,
+    status,
+    code,
+    param,
+    requestId,
+    bodyShape: bodyShape(body),
+    eventType,
+    incompleteReason,
+  });
 }
 
 type ParsedEvent = Readonly<{ type: string; body: Record<string, unknown> }>;
@@ -295,7 +351,7 @@ async function consumeCompletedStream(response: Response, fetchRequestId: string
       return;
     }
     if (event.type === "response.failed" || event.type === "response.incomplete" || event.type === "error") {
-      throw streamFailure(event.body, fetchRequestId, response.status);
+      throw streamFailure(event.type, event.body, fetchRequestId, response.status);
     }
   };
   const appendDecodedText = (decoded: string) => {
