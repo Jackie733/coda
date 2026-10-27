@@ -1,0 +1,376 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { parsePatchArguments, runPatchCli } from "../src/patch-cli.js";
+
+type Fixture = Readonly<{ root: string; outsideFile: string; commandMarkers: readonly string[] }>;
+
+function git(root: string, ...args: string[]): Buffer {
+  return execFileSync("git", [
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "filter.fixture-marker.clean=",
+    "-c", "filter.fixture-marker.smudge=",
+    "-c", "filter.fixture-marker.process=",
+    "-c", "filter.fixture-marker.required=false",
+    ...args,
+  ], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+}
+
+function setLocalGitConfig(root: string, key: string, value: string): void {
+  execFileSync("git", ["config", "--local", key, value], { cwd: root, stdio: "ignore" });
+}
+
+async function createDirtyRepository(): Promise<Fixture> {
+  const root = await mkdtemp(path.join(os.tmpdir(), "patch-cli-fixture-"));
+  const runGit = (...args: string[]) => git(root, ...args);
+  runGit("init", "-b", "fixture-main");
+  setLocalGitConfig(root, "user.email", "fixture@example.invalid");
+  setLocalGitConfig(root, "user.name", "Synthetic Fixture");
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await mkdir(path.join(root, "secrets"), { recursive: true });
+  const outsideFile = `${root}-outside.ts`;
+  const smudgeMarker = `${root}-smudge-ran`;
+  const cleanMarker = `${root}-clean-ran`;
+  const processMarker = `${root}-process-ran`;
+  const hookMarker = `${root}-hook-ran`;
+  const hooksDirectory = path.join(root, "fixture-hooks");
+  await writeFile(outsideFile, "export const outside = 'never-read';\n");
+  await mkdir(hooksDirectory, { recursive: true });
+  await writeFile(path.join(root, "src", "main.ts"), 'export function greeting() {\n  return "before";\n}\n');
+  await writeFile(path.join(root, ".gitattributes"), "src/main.ts filter=fixture-marker\n");
+  const postCheckout = path.join(hooksDirectory, "post-checkout");
+  await writeFile(postCheckout, `#!/bin/sh\nprintf executed > "${hookMarker}"\n`);
+  await chmod(postCheckout, 0o755);
+  await writeFile(path.join(root, "src", "outside-link.ts"), "export const linked = false;\n");
+  await rm(path.join(root, "src", "outside-link.ts"));
+  await symlink(outsideFile, path.join(root, "src", "outside-link.ts"));
+  await writeFile(path.join(root, "README.md"), "# Fixture\nBaseline README.\n");
+  await writeFile(path.join(root, ".env.local"), "FIXTURE_SECRET=never-include-this\n");
+  await writeFile(path.join(root, "secrets", "token.ts"), "export const secret = 'never-include-this-either';\n");
+  runGit("add", "-A");
+  runGit("commit", "-m", "synthetic fixture");
+  setLocalGitConfig(root, "filter.fixture-marker.clean", `touch ${cleanMarker}`);
+  setLocalGitConfig(root, "filter.fixture-marker.smudge", `touch ${smudgeMarker}`);
+  setLocalGitConfig(root, "filter.fixture-marker.process", `touch ${processMarker}`);
+  setLocalGitConfig(root, "core.hooksPath", hooksDirectory);
+
+  // Deliberately preserve all three source-worktree states while the tool bases its new worktree on HEAD.
+  await writeFile(path.join(root, "src", "main.ts"), 'export function greeting() {\n  return "user unstaged change";\n}\n');
+  await writeFile(path.join(root, "README.md"), "# Fixture\nUser staged change.\n");
+  runGit("add", "README.md");
+  await writeFile(path.join(root, "local-notes.txt"), "Untracked local note: do not copy.\n");
+  return { root, outsideFile, commandMarkers: [cleanMarker, smudgeMarker, processMarker, hookMarker] };
+}
+
+async function withDirtyRepository<T>(callback: (fixture: Fixture) => Promise<T>): Promise<T> {
+  const fixture = await createDirtyRepository();
+  try {
+    const result = await callback(fixture);
+    for (const marker of fixture.commandMarkers) {
+      await assert.rejects(
+        readFile(marker),
+        (error: unknown) => error instanceof Error && "code" in error && error.code === "ENOENT",
+        `Git filter or hook unexpectedly ran and created ${marker}`,
+      );
+    }
+    return result;
+  } finally {
+    try {
+      const listing = git(fixture.root, "worktree", "list", "--porcelain").toString("utf8");
+      for (const line of listing.split("\n")) {
+        if (!line.startsWith("worktree ")) continue;
+        const worktree = line.slice("worktree ".length);
+        if (worktree === fixture.root) continue;
+        try {
+          git(fixture.root, "worktree", "remove", "--force", worktree);
+        } catch {
+          // Fixture cleanup is best effort; production cleanup behavior is asserted by each test.
+        }
+        await rm(path.dirname(worktree), { recursive: true, force: true });
+      }
+    } catch {
+      // The fixture may not have reached a valid Git repository.
+    }
+    await rm(fixture.root, { recursive: true, force: true });
+    await rm(fixture.outsideFile, { force: true });
+    for (const marker of fixture.commandMarkers) await rm(marker, { force: true });
+  }
+}
+
+async function originState(root: string): Promise<Readonly<Record<string, string>>> {
+  return {
+    head: git(root, "rev-parse", "HEAD").toString("utf8").trim(),
+    branch: git(root, "rev-parse", "--abbrev-ref", "HEAD").toString("utf8").trim(),
+    status: git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").toString("hex"),
+    stagedDiff: git(root, "diff", "--cached", "--binary", "HEAD").toString("hex"),
+    unstagedDiff: git(root, "diff", "--binary").toString("hex"),
+    mainFile: (await readFile(path.join(root, "src", "main.ts"))).toString("hex"),
+    readmeFile: (await readFile(path.join(root, "README.md"))).toString("hex"),
+    untrackedFile: (await readFile(path.join(root, "local-notes.txt"))).toString("hex"),
+  };
+}
+
+function captureOutput() {
+  let value = "";
+  return {
+    writer: { write: (chunk: string | Uint8Array) => { value += String(chunk); return true; } },
+    get text() { return value; },
+  };
+}
+
+function patchContent(options: Readonly<{ path?: string; oldText?: string; newText?: string; citationPath?: string }> = {}): string {
+  return JSON.stringify({
+    patches: [{
+      path: options.path ?? "src/main.ts",
+      edits: [{
+        oldText: options.oldText ?? 'return "before";',
+        newText: options.newText ?? 'return "after";',
+        reason: "更新问候函数的返回值。",
+        citations: [{ path: options.citationPath ?? "src/main.ts", startLine: 1, endLine: 3 }],
+      }],
+    }],
+  });
+}
+
+function mockResponse(content: string): Response {
+  return Response.json({ choices: [{ message: { role: "assistant", content } }] });
+}
+
+function commonOptions(root: string, output: ReturnType<typeof captureOutput>, content: string, disposition: "keep" | "discard" | null) {
+  let fetchCalls = 0;
+  let sentBody = "";
+  const options = {
+    cwd: root,
+    plan: "只更新 greeting 的返回值，不改变其他行为。",
+    files: ["src/main.ts"],
+    env: {
+      OPENAI_API_KEY: "mock-only-key",
+      OPENAI_MODEL: "mock-model",
+      OPENAI_BASE_URL: "https://mock.example/v1",
+    },
+    stdout: output.writer,
+    approvePlan: async () => true,
+    confirmSend: async () => true,
+    chooseDisposition: async () => disposition,
+    fetchImpl: async (_input: RequestInfo | URL, init?: RequestInit) => {
+      fetchCalls += 1;
+      sentBody = String(init?.body ?? "");
+      return mockResponse(content);
+    },
+  };
+  return {
+    options,
+    get fetchCalls() { return fetchCalls; },
+    get sentBody() { return sentBody; },
+  };
+}
+
+function keptWorktreePath(output: string): string {
+  const match = output.match(/已生成并保留隔离工作树（未提交）：([^\r\n]+)/);
+  assert.ok(match, "keep flow should report the exact isolated worktree path");
+  return match[1] as string;
+}
+
+test("patch CLI requires an explicit plan and exact safe repository-relative file list", () => {
+  assert.deepEqual(parsePatchArguments(["--plan", "Fix greeting", "--file", "src/main.ts"]), {
+    plan: "Fix greeting",
+    files: ["src/main.ts"],
+  });
+  for (const args of [
+    [],
+    ["--plan", "", "--file", "src/main.ts"],
+    ["--plan", "Fix", "--file", "../src/main.ts"],
+    ["--plan", "Fix", "--file", "/tmp/main.ts"],
+    ["--plan", "Fix", "--file", "C:/tmp/main.ts"],
+    ["--plan", "Fix", "--file", "src/*.ts"],
+    ["--plan", "Fix", "--file", ".git/index"],
+    ["--plan", "Fix", "--file", ".env.local"],
+    ["--plan", "Fix", "--file", "src/main.ts", "--file", "src/main.ts"],
+  ]) assert.throws(() => parsePatchArguments(args));
+});
+
+test("cancel sends nothing, does not read the API key, removes its isolated worktree, and preserves staged/unstaged/untracked origin state", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const output = captureOutput();
+    let fetchCalls = 0;
+    let keyRead = false;
+    const exitCode = await runPatchCli({
+      cwd: root,
+      plan: "只更新 greeting 的返回值。",
+      files: ["src/main.ts"],
+      env: {
+        OPENAI_MODEL: "mock-model",
+        OPENAI_BASE_URL: "https://mock.example/v1",
+        get OPENAI_API_KEY() { keyRead = true; throw new Error("must not read before approval"); },
+      },
+      stdout: output.writer,
+      approvePlan: async () => true,
+      confirmSend: async () => false,
+      fetchImpl: async () => { fetchCalls += 1; throw new Error("mock fetch must not run"); },
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(fetchCalls, 0);
+    assert.equal(keyRead, false);
+    assert.match(output.text, /已取消：未发送模型请求/);
+    assert.match(output.text, /隔离工作树状态：已丢弃/);
+    assert.deepEqual(await originState(root), before);
+  });
+});
+
+test("declining the exact plan and file scope creates no worktree and sends no request", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const output = captureOutput();
+    let fetchCalls = 0;
+    const exitCode = await runPatchCli({
+      cwd: root,
+      plan: "只更新 greeting 的返回值。",
+      files: ["src/main.ts"],
+      env: { OPENAI_API_KEY: "mock-only-key", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: output.writer,
+      approvePlan: async () => false,
+      confirmSend: async () => true,
+      fetchImpl: async () => { fetchCalls += 1; throw new Error("mock fetch must not run"); },
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(fetchCalls, 0);
+    assert.match(output.text, /计划或文件范围未批准/);
+    assert.match(output.text, /没有创建隔离工作树或发送请求/);
+    assert.equal(git(root, "worktree", "list", "--porcelain").toString("utf8").split("\n").filter((line) => line.startsWith("worktree ")).length, 1);
+    assert.deepEqual(await originState(root), before);
+  });
+});
+
+test("approved patch preview is the exact mock request, diff equals kept worktree, and origin worktree is unchanged", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const output = captureOutput();
+    const mock = commonOptions(root, output, patchContent(), "keep");
+    const exitCode = await runPatchCli(mock.options);
+
+    assert.equal(exitCode, 0);
+    assert.equal(mock.fetchCalls, 1);
+    assert.equal(mock.sentBody.length > 0, true);
+    assert.ok(output.text.includes(mock.sentBody), "the exact serialized request body must be previewed before sending");
+    assert.match(output.text, /https:\/\/mock\.example\/v1\/chat\/completions/);
+    assert.match(output.text, /只更新 greeting 的返回值/);
+    assert.match(output.text, /src\/main\.ts/);
+    assert.doesNotMatch(mock.sentBody, /never-include-this|user unstaged change|User staged change|Untracked local note|Baseline README/);
+    assert.match(output.text, /候选补丁在隔离工作树中相对基准 HEAD 的完整 diff/);
+    assert.match(output.text, /-  return "before";/);
+    assert.match(output.text, /\+  return "after";/);
+    assert.match(output.text, /引用：src\/main\.ts:1-3/);
+
+    const worktree = keptWorktreePath(output.text);
+    const materialized = await readdir(worktree);
+    assert.ok(!materialized.includes(".env.local"));
+    assert.ok(!materialized.includes("secrets"));
+    const exactDiff = git(worktree, "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "HEAD", "--").toString("utf8");
+    assert.ok(exactDiff.length > 0);
+    assert.ok(output.text.includes(exactDiff), "displayed diff must exactly match git diff in the kept worktree");
+    assert.equal((await readFile(path.join(worktree, "src", "main.ts"), "utf8")).includes('return "after";'), true);
+    assert.deepEqual(await originState(root), before);
+  });
+});
+
+test("discard removes generated isolated worktree without changing the source worktree", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const output = captureOutput();
+    const mock = commonOptions(root, output, patchContent(), "discard");
+    const exitCode = await runPatchCli(mock.options);
+
+    assert.equal(exitCode, 0);
+    assert.equal(mock.fetchCalls, 1);
+    assert.match(output.text, /已生成后丢弃隔离补丁工作树/);
+    assert.match(output.text, /隔离工作树状态：已丢弃/);
+    assert.deepEqual(await originState(root), before);
+    const listing = git(root, "worktree", "list", "--porcelain").toString("utf8");
+    assert.equal(listing.split("\n").filter((line) => line.startsWith("worktree ")).length, 1);
+  });
+});
+
+test("malformed model patches fail closed and preserve origin state", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const invalidResponses = [
+      patchContent({ path: "README.md" }),
+      patchContent({ path: "../README.md" }),
+      patchContent({ oldText: "not present in selected HEAD" }),
+      patchContent({ citationPath: "../README.md" }),
+      "not JSON",
+    ];
+
+    for (const content of invalidResponses) {
+      const output = captureOutput();
+      const mock = commonOptions(root, output, content, "keep");
+      const exitCode = await runPatchCli(mock.options);
+      assert.equal(exitCode, 1, content);
+      assert.equal(mock.fetchCalls, 1);
+      assert.doesNotMatch(output.text, /已保留隔离工作树|已生成后丢弃隔离补丁工作树/);
+      assert.match(output.text, /补丁流程失败/);
+      assert.deepEqual(await originState(root), before);
+      assert.equal(git(root, "worktree", "list", "--porcelain").toString("utf8").split("\n").filter((line) => line.startsWith("worktree ")).length, 1);
+    }
+  });
+});
+
+test("absolute, traversal, excluded-secret, .git, and symlink paths are rejected before any model request", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    for (const file of ["../README.md", path.join(root, "src", "main.ts"), ".env.local", ".git/index"]) {
+      const output = captureOutput();
+      let fetchCalls = 0;
+      const exitCode = await runPatchCli({
+        cwd: root,
+        plan: "仅修改用户批准的目标文件。",
+        files: [file],
+        env: { OPENAI_API_KEY: "mock-only-key", OPENAI_BASE_URL: "https://mock.example/v1" },
+        stdout: output.writer,
+        confirmSend: async () => true,
+        fetchImpl: async () => { fetchCalls += 1; return mockResponse(patchContent()); },
+      });
+      assert.equal(exitCode, 2, file);
+      assert.equal(fetchCalls, 0, file);
+      assert.match(output.text, /未启动补丁流程/);
+    }
+    const symlinkOutput = captureOutput();
+    let symlinkFetchCalls = 0;
+    const symlinkExit = await runPatchCli({
+      cwd: root,
+      plan: "仅修改用户批准的目标文件。",
+      files: ["src/outside-link.ts"],
+      env: { OPENAI_API_KEY: "mock-only-key", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: symlinkOutput.writer,
+      approvePlan: async () => true,
+      confirmSend: async () => true,
+      fetchImpl: async () => { symlinkFetchCalls += 1; return mockResponse(patchContent()); },
+    });
+    assert.equal(symlinkExit, 1);
+    assert.equal(symlinkFetchCalls, 0);
+    assert.match(symlinkOutput.text, /符号链接/);
+  });
+});
+
+test("terminal controls in model edits are rejected and never printed raw", async () => {
+  await withDirtyRepository(async ({ root }) => {
+    const before = await originState(root);
+    const output = captureOutput();
+    const mock = commonOptions(root, output, patchContent({ newText: 'return "\u001b[31mred\u001b[0m";' }), "discard");
+    const exitCode = await runPatchCli(mock.options);
+
+    assert.equal(exitCode, 1);
+    assert.doesNotMatch(output.text, /\u001b/);
+    assert.match(output.text, /补丁流程失败/);
+    assert.deepEqual(await originState(root), before);
+  });
+});
+
+test("patch argument parser does not treat commands or extra options as executable input", () => {
+  assert.throws(() => parsePatchArguments(["--plan", "Fix", "--file", "src/main.ts", "--run", "echo unsafe"]));
+});

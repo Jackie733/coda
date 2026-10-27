@@ -136,7 +136,7 @@ type EntryAssessment = Readonly<{
   problems: readonly string[];
 }>;
 
-function visibleControls(text: string): string {
+export function visibleControls(text: string): string {
   return text.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, (character) => {
     const code = character.codePointAt(0) ?? 0;
     return code <= 0xff

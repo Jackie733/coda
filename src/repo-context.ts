@@ -68,7 +68,7 @@ const KNOWN_SECRET_VALUE_PATTERNS = [
   /\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b/,
 ];
 
-function containsLikelySecret(text: string): boolean {
+export function containsLikelySecret(text: string): boolean {
   for (const match of text.matchAll(SENSITIVE_ASSIGNMENT)) {
     if (SENSITIVE_VARIABLE_NAME.test(match[1] ?? "")) return true;
   }
@@ -106,10 +106,11 @@ function isWithinRoot(root: string, candidate: string): boolean {
   return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
 }
 
-function isAllowedCandidate(relativePath: string): boolean {
+export function isSafeRepositoryPath(relativePath: string): boolean {
   if (
     !relativePath ||
     path.posix.isAbsolute(relativePath) ||
+    /^[a-zA-Z]:/.test(relativePath) ||
     relativePath.includes("\\") ||
     /[\u0000-\u001f\u007f]/.test(relativePath)
   ) return false;
@@ -199,7 +200,7 @@ function formatFile(relativePath: string, text: string): string {
 
 async function collectContext(root: string, trackedPaths: string[]): Promise<Pick<RepositorySnapshot, "context" | "includedFiles" | "skippedCandidateFiles" | "contextBytes">> {
   const candidates = [...new Set(trackedPaths)]
-    .filter(isAllowedCandidate)
+    .filter(isSafeRepositoryPath)
     .sort((a, b) => priority(a) - priority(b) || a.localeCompare(b));
   const blocks: string[] = [];
   const includedFiles: string[] = [];
