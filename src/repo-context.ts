@@ -60,11 +60,20 @@ const DENIED_FILE_NAMES = new Set([
   "bun.lockb", "cargo.lock", "poetry.lock", "composer.lock", "gemfile.lock",
 ]);
 const DISALLOWED_CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u202a-\u202e\u2066-\u2069]/;
-const LIKELY_SECRET_PATTERNS = [
+const SENSITIVE_ASSIGNMENT = /(?:^|[^A-Za-z0-9_$])(?:export\s+)?(?:(?:const|let|var|final|val)\s+)?["']?([A-Za-z_$][A-Za-z0-9_$.-]*)["']?\s*(?:=|:)(?!=|>)/gim;
+const SENSITIVE_VARIABLE_NAME = /password|passwd|passphrase|(?:^|[^a-z])pwd(?:$|[^a-z])|secret|token|credential|(?:api|access|private|client|signing|encryption)[_-]?key/i;
+const CREDENTIAL_DATABASE_URL = /\b(?:jdbc:(?:postgres(?:ql)?|mysql|mariadb|mongodb|sqlserver)|postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|cockroachdb|sqlserver|mssql):\/\/[^\s/@]*:[^\s/@]*@/i;
+const KNOWN_SECRET_VALUE_PATTERNS = [
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/i,
   /\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b/,
-  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|token|password|passwd|pwd|secret)\b\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[A-Za-z0-9_./+=-]+)/i,
 ];
+
+function containsLikelySecret(text: string): boolean {
+  for (const match of text.matchAll(SENSITIVE_ASSIGNMENT)) {
+    if (SENSITIVE_VARIABLE_NAME.test(match[1] ?? "")) return true;
+  }
+  return CREDENTIAL_DATABASE_URL.test(text) || KNOWN_SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(text));
+}
 
 export type RepositorySnapshot = Readonly<{
   root: string;
@@ -169,7 +178,7 @@ async function readSafeTextFile(root: string, relativePath: string): Promise<str
     } catch {
       return null;
     }
-    if (DISALLOWED_CONTROLS.test(text) || LIKELY_SECRET_PATTERNS.some((pattern) => pattern.test(text))) return null;
+    if (DISALLOWED_CONTROLS.test(text) || containsLikelySecret(text)) return null;
     return text;
   } catch {
     return null;

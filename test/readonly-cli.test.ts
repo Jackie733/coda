@@ -27,6 +27,8 @@ async function createSyntheticRepository(): Promise<string> {
   await writeFile(path.join(root, "package.json"), '{"name":"fixture-only"}\n');
   await writeFile(path.join(root, "src", "main.ts"), "export function greeting() {\n  return 'fixture-only';\n}\n");
   await writeFile(path.join(root, "src", "config.ts"), 'const password = "hunter2";\nexport const apiKey = "short-test-key";\n');
+  await writeFile(path.join(root, "src", "credential-assignments.ts"), 'const refreshToken = "fixture-refresh-token";\nconst clientSecret = "fixture-client-secret";\nconst DB_PASSWORD = "fixture-db-password";\n');
+  await writeFile(path.join(root, "src", "credential-database-url.ts"), 'const DATABASE_URL = "postgresql://fixture_user:fixture_pass@db.example.invalid:5432/app";\n');
   await writeFile(path.join(root, "src", ".env-cache", "leak.ts"), "export const hidden = 'env-directory-secret';\n");
   await writeFile(path.join(root, "src", ".aws", "credentials.ts"), "export const hidden = 'credential-directory-secret';\n");
   await writeFile(path.join(root, "src", "nested-safe", "child.ts"), "export const nested = 'in-repo-before-link';\n");
@@ -108,8 +110,14 @@ test("repository inspection reports Git metadata and only bounded safe tracked t
     assert.ok(!snapshot.context.includes("env-directory-secret"));
     assert.ok(!snapshot.context.includes("credential-directory-secret"));
     assert.ok(!snapshot.includedFiles.includes("src/config.ts"));
+    assert.ok(!snapshot.includedFiles.includes("src/credential-assignments.ts"));
+    assert.ok(!snapshot.includedFiles.includes("src/credential-database-url.ts"));
     assert.ok(!snapshot.context.includes("hunter2"));
     assert.ok(!snapshot.context.includes("short-test-key"));
+    assert.ok(!snapshot.context.includes("fixture-refresh-token"));
+    assert.ok(!snapshot.context.includes("fixture-client-secret"));
+    assert.ok(!snapshot.context.includes("fixture-db-password"));
+    assert.ok(!snapshot.context.includes("fixture_user:fixture_pass"));
     assert.ok(!snapshot.context.includes("outsideSecret"));
     assert.ok(!snapshot.context.includes("dependency"));
     assert.ok(!snapshot.context.includes("built"));
@@ -193,7 +201,10 @@ test("explicit consent sends exactly the complete immutable payload shown in pre
         sentBody = String(init?.body);
         assert.equal(init?.redirect, "error");
         assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${key}`);
-        return Response.json({ choices: [{ message: { role: "assistant", content: "理解：`src/main.ts:1-3` 提供问候函数。\n计划：核对调用方，然后检查测试。" } }] });
+        return Response.json({ choices: [{ message: { role: "assistant", content: JSON.stringify({
+          understanding: [{ text: "提供问候函数。", citations: [{ path: "src/main.ts", startLine: 1, endLine: 3 }] }],
+          plan: [{ text: "核对调用方。", citations: [{ path: "README.md", startLine: 1, endLine: 2 }] }],
+        }) } }] });
       },
     });
 
@@ -201,23 +212,32 @@ test("explicit consent sends exactly the complete immutable payload shown in pre
     assert.equal(fetchCount, 1);
     assert.equal(sentUrl, "https://mock.example/v1/chat/completions");
     assert.ok(output.text.includes(sentBody), "the exact body string must have been previewed");
-    const sentPayload = JSON.parse(sentBody) as { model: string; messages: Array<{ role: string; content: string }> };
+    const sentPayload = JSON.parse(sentBody) as {
+      model: string;
+      messages: Array<{ role: string; content: string }>;
+      response_format: { type: string; json_schema: { name: string; strict: boolean } };
+    };
     assert.equal(sentPayload.model, "synthetic-model");
+    assert.equal(sentPayload.response_format.type, "json_schema");
+    assert.equal(sentPayload.response_format.json_schema.name, "readonly_code_understanding");
+    assert.equal(sentPayload.response_format.json_schema.strict, true);
     assert.ok(sentPayload.messages[1].content.includes("fixture-only"));
     assert.ok(sentPayload.messages[1].content.includes("src/main.ts"));
     assert.ok(!sentPayload.messages[1].content.includes("never-include-this"));
     assert.ok(!sentBody.includes(key), "credentials must never appear in the payload");
     assert.match(output.text, /src\/main\.ts:1-3/);
+    assert.match(output.text, /理解：\n1\. 已验证（引用结构）/);
+    assert.match(output.text, /计划：\n1\. 已验证（引用结构）/);
+    assert.match(output.text, /不证明引用在语义上支持该条目/);
     assert.match(output.text, /不会编辑文件/);
   });
 });
 
-test("model answers without citations or with out-of-context citations are marked unverified", async () => {
+test("unstructured model responses are marked unverified", async () => {
   await withRepository(async (root) => {
     for (const content of [
       "理解：代码提供问候函数。计划：检查调用者。",
-      "理解：代码提供问候函数。依据 `src/not-in-context.ts:1`。",
-      "理解：代码提供问候函数。依据 `src/main.ts:99`。",
+      JSON.stringify({ understanding: [{ text: "缺少计划数组", citations: [] }] }),
     ]) {
       const output = captureOutput();
       const exitCode = await runReadonlyCli({
@@ -232,8 +252,73 @@ test("model answers without citations or with out-of-context citations are marke
       assert.match(output.text, /回答未验证\/未完成/);
       assert.doesNotMatch(output.text, /引用路径和行号已核对/);
       assert.doesNotMatch(output.text, /模型理解与短计划/);
-      assert.match(output.text, /未验证的模型文本/);
+      assert.match(output.text, /未验证的模型输出/);
     }
+  });
+});
+
+test("each non-empty understanding and plan item is validated only against its own citations", async () => {
+  await withRepository(async (root) => {
+    const output = captureOutput();
+    const content = JSON.stringify({
+      understanding: [
+        { text: "有效的独立理解条目。", citations: [{ path: "src/main.ts", startLine: 1, endLine: 3 }] },
+        { text: "没有引用的理解条目。", citations: [] },
+        { text: "引用未包含文件。", citations: [{ path: "src/not-in-context.ts", startLine: 1, endLine: 1 }] },
+        { text: "引用字段缺失的理解条目。" },
+      ],
+      plan: [
+        { text: "有效计划条目。", citations: [{ path: "README.md", startLine: 1, endLine: 2 }] },
+        { text: "行号越界的计划条目。", citations: [{ path: "src/main.ts", startLine: 99, endLine: 99 }] },
+        { text: "第三步。", citations: [{ path: "src/main.ts", startLine: 1, endLine: 3 }] },
+        { text: "超出三步限制的条目。", citations: [{ path: "src/main.ts", startLine: 1, endLine: 3 }] },
+      ],
+    });
+    const exitCode = await runReadonlyCli({
+      cwd: root,
+      env: { OPENAI_API_KEY: "mock-only-key", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: output.writer,
+      confirmSend: async () => true,
+      fetchImpl: async () => Response.json({ choices: [{ message: { role: "assistant", content } }] }),
+    });
+
+    assert.equal(exitCode, 1);
+    assert.match(output.text, /1\. 已验证（引用结构）：有效的独立理解条目/);
+    assert.match(output.text, /2\. 未验证：没有引用的理解条目/);
+    assert.match(output.text, /3\. 未验证：引用未包含文件/);
+    assert.match(output.text, /4\. 未验证：引用字段缺失的理解条目/);
+    assert.match(output.text, /1\. 已验证（引用结构）：有效计划条目/);
+    assert.match(output.text, /2\. 未验证：行号越界的计划条目/);
+    assert.match(output.text, /4\. 未验证：超出三步限制的条目/);
+    assert.match(output.text, /没有提供来源引用/);
+    assert.match(output.text, /缺少 citations 引用数组/);
+    assert.match(output.text, /文件不在本次上下文中/);
+    assert.match(output.text, /行号不在本次上下文范围内/);
+  });
+});
+
+test("model ANSI, OSC, C0, and C1 controls are rendered as visible escapes", async () => {
+  await withRepository(async (root) => {
+    const output = captureOutput();
+    const text = "ANSI \u001b[31mred\u001b[0m OSC \u001b]8;;https://example.invalid\u0007link\u001b]8;;\u001b\\ C1 \u009b31m C0 \u0000";
+    const content = JSON.stringify({
+      understanding: [{ text, citations: [{ path: "src/main.ts", startLine: 1, endLine: 3 }] }],
+      plan: [{ text: "检查调用方。", citations: [{ path: "README.md", startLine: 1, endLine: 2 }] }],
+    });
+    const exitCode = await runReadonlyCli({
+      cwd: root,
+      env: { OPENAI_API_KEY: "mock-only-key", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: output.writer,
+      confirmSend: async () => true,
+      fetchImpl: async () => Response.json({ choices: [{ message: { role: "assistant", content } }] }),
+    });
+
+    assert.equal(exitCode, 0);
+    assert.match(output.text, /\\x1B\[31mred\\x1B\[0m/);
+    assert.match(output.text, /\\x1B\]8;;https:\/\/example\.invalid\\x07link/);
+    assert.match(output.text, /\\x9B31m/);
+    assert.match(output.text, /\\x00/);
+    assert.doesNotMatch(output.text, /\u001b|\u009b|\u0000|\u0007/);
   });
 });
 
