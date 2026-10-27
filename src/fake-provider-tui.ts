@@ -311,6 +311,7 @@ class TuiTerminal {
       this.#readline?.off("SIGINT", this.#lineSigintHandler);
       this.#readline?.close();
     }
+    this.#input.pause();
   }
 
   #draw(): void {

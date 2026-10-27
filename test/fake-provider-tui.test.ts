@@ -308,10 +308,13 @@ test("CLI completes a keyboard approval flow under a real PTY", { skip: process.
     await waitFor("完整请求预览");
     child.stdin.write("y");
     await waitFor("只读理解结果");
-    child.stdin.end("q");
+    child.stdin.write("b");
+    await waitFor("提示：流程结束或取消");
+    child.stdin.write("q");
+    assert.equal(child.stdin.writableEnded, false, "parent stdin must remain open after q");
     const code = await Promise.race([
       new Promise<number | null>((resolve) => child.once("close", (exitCode) => resolve(exitCode))),
-      delay(5000).then(() => "timeout" as const),
+      delay(2000).then(() => "timeout" as const),
     ]);
     assert.notEqual(code, "timeout", "PTY CLI should not hang");
     assert.equal(code, 0);
