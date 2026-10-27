@@ -16,7 +16,7 @@ export function safeCliErrorText(value: unknown, fallback: string): string {
 
   const detectionText = message
     .replace(C0_C1_CONTROLS, " ")
-    .replace(BIDI_CONTROLS, " ")
+    .replace(BIDI_CONTROLS, "")
     .replace(/\s+/g, " ")
     .trim();
   if (!detectionText || SECRET_PATTERNS.some((pattern) => pattern.test(detectionText))) return fallback;

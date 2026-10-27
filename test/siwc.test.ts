@@ -472,12 +472,13 @@ test("identity-only login discloses OAuth data handling before opening authoriza
 
 test("SIWC CLI hides a token-bearing argument from its top-level error output", async () => {
   const secret = CALLBACK_ACCESS_TOKEN;
+  const bidiSecret = `${secret.slice(0, 12)}${String.fromCodePoint(0x202e)}${secret.slice(12)}`;
   const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
-  const exitCode = await runSiwcCli({ argv: ["login", secret], stdout: output });
+  const exitCode = await runSiwcCli({ argv: ["login", bidiSecret], stdout: output });
 
   assert.equal(exitCode, 1);
   assert.match(output.value, /为保护凭据，错误详情已隐藏/);
-  assert.doesNotMatch(output.value, /synthetic-access-token-never-log/);
+  assert.doesNotMatch(output.value, /synthetic-access-token-never-log|\u202e/);
 });
 
 test("PKCE and dynamic authorization use the official registration contract and exact loopback URI", () => {
@@ -1443,8 +1444,10 @@ test("a stream without response.completed fails and direct-admission detail text
     { status: 403, requestId: "synthetic-admission-nested-detail", code: "chatpass_v2_scope_not_authorized", param: "resource.invoke", nestedDetail: true, detailText: "nested private detail", expectedDetail: null },
     { status: 401, requestId: "synthetic-admission-detail-code", detailText: "invalid_grant", expectedDetail: "invalid_grant" },
     { status: 403, requestId: "synthetic-admission-control", detailText: "policy\ndenied", expectedDetail: "policy denied" },
-    { status: 403, requestId: "synthetic-admission-bidi", detailText: `safe-before${String.fromCodePoint(0x202e)}spoofed-after${String.fromCodePoint(0x2066)}left${String.fromCodePoint(0x2067)}right${String.fromCodePoint(0x2068)}first${String.fromCodePoint(0x2069)}done`, expectedDetail: "safe-before\\u202Espoofed-after\\u2066left\\u2067right\\u2068first\\u2069done" },
+    { status: 403, requestId: "synthetic-admission-bidi", detailText: `safe-before ${String.fromCodePoint(0x202e)} spoofed-after ${String.fromCodePoint(0x2066)} left ${String.fromCodePoint(0x2067)} right ${String.fromCodePoint(0x2068)} first ${String.fromCodePoint(0x2069)} done`, expectedDetail: "safe-before \\u202E spoofed-after \\u2066 left \\u2067 right \\u2068 first \\u2069 done" },
     { status: 403, requestId: "synthetic-admission-bidi-secret", detailText: `synthetic access${String.fromCodePoint(0x202e)}_token must-not-display`, expectedDetail: null },
+    { status: 403, requestId: "synthetic-admission-bidi-long-token", detailText: `abcdefghijklmnop${String.fromCodePoint(0x202e)}qrstuvwxyzABCDEF`, expectedDetail: null },
+    { status: 403, requestId: "synthetic-admission-bidi-url", detailText: `https:${String.fromCodePoint(0x202e)}//synthetic.example/credential`, expectedDetail: null },
     { status: 403, requestId: "synthetic-admission-length", detailText: "diagnostic text ".repeat(30), expectedDetail: `${"diagnostic text ".repeat(30).slice(0, 239)}…` },
   ];
   for (const item of admissionCases) {
@@ -1480,7 +1483,7 @@ test("a stream without response.completed fails and direct-admission detail text
       if (nestedDetail) assert.doesNotMatch(message, /error.code=chatpass_v2_scope_not_authorized|error.param=resource\.invoke/);
       if (item.expectedDetail) assert.ok(message.includes(JSON.stringify(item.expectedDetail)));
       assert.doesNotMatch(message, /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/);
-      assert.doesNotMatch(message, /synthetic-access-token-never-log|synthetic-injected-param-secret|nested private detail|must-not-display/);
+      assert.doesNotMatch(message, /synthetic-access-token-never-log|synthetic-injected-param-secret|nested private detail|must-not-display|abcdefghijklmnop|qrstuvwxyzABCDEF|synthetic\.example/);
       return true;
     });
   }
