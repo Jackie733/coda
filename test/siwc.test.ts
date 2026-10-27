@@ -153,6 +153,7 @@ function makeAuthorizationMocks(options: Readonly<{
   denial?: boolean;
   callbackClientId?: string;
   callbackCode?: string;
+  omitCallbackClientId?: boolean;
   callbackExpectedStatus?: number;
   tokenError?: Readonly<{ code: string; status?: number; requestId?: string; description?: string }>;
 }> = {}) {
@@ -207,7 +208,7 @@ function makeAuthorizationMocks(options: Readonly<{
     const callback = new URL(redirectUri);
     callback.searchParams.set("code", options.callbackCode ?? "synthetic-authorization-code");
     callback.searchParams.set("state", authorizationUrl.searchParams.get("state") ?? "");
-    callback.searchParams.set("client_id", callbackClientId);
+    if (!options.omitCallbackClientId) callback.searchParams.set("client_id", callbackClientId);
     const completed = await fetch(callback);
     assert.equal(completed.status, options.callbackExpectedStatus ?? 200);
   };
@@ -573,7 +574,7 @@ test("authorization-code exchange maps invalid_grant and invalid_client without 
   const cases = [
     {
       code: "invalid_grant",
-      expected: /丢弃.*不会重试.*全新授权/,
+      expected: /丢弃本次 authorization code.*不要再次提交或复用该 code.*该尝试关联的 issued client ID/,
     },
     {
       code: "invalid_client",
@@ -586,6 +587,7 @@ test("authorization-code exchange maps invalid_grant and invalid_client without 
       const requestId = `synthetic-oauth-${item.code}`;
       const secretDescription = `synthetic token-bearing description ${CALLBACK_ACCESS_TOKEN}`;
       const mocks = makeAuthorizationMocks({
+        ...(item.code === "invalid_grant" ? { omitCallbackClientId: true } : {}),
         tokenError: { code: item.code, status: 400, requestId, description: secretDescription },
       });
       const output = { value: "", write(chunk: string | Uint8Array) { this.value += String(chunk); return true; } };
@@ -600,9 +602,11 @@ test("authorization-code exchange maps invalid_grant and invalid_client without 
       assert.equal(mocks.getTokenExchangeCount(), 1);
       assert.match(output.value, item.expected);
       if (item.code === "invalid_grant") {
-        assert.ok(output.value.includes(`client ID ${ISSUED_CLIENT_ID}`));
+        assert.ok(output.value.includes(`issued client ID 为 ${ISSUED_CLIENT_ID}`));
+        assert.equal(mocks.getTokenBody()?.get("client_id"), ISSUED_CLIENT_ID);
         assert.match(output.value, new RegExp(`npm run siwc -- login --plan-usage --client-id ${ISSUED_CLIENT_ID}`));
         assert.match(output.value, /不会再次使用 dynamic_agent_client 注册/);
+        assert.doesNotMatch(output.value, /回调签发的 client ID/);
       }
       assert.match(output.value, new RegExp(`OAuth error=${item.code}`));
       assert.match(output.value, /HTTP 400/);
@@ -640,8 +644,9 @@ test("first-registration invalid_grant reauthorizes with the issued client ID an
     assert.equal(first.getTokenBody()?.get("client_id"), ISSUED_CLIENT_ID);
     assert.equal(first.getTokenBody()?.get("code"), "synthetic-old-authorization-code");
     assert.equal(first.getTokenExchangeCount(), 1);
-    assert.ok(firstOutput.value.includes(`client ID ${ISSUED_CLIENT_ID}`));
+    assert.ok(firstOutput.value.includes(`issued client ID 为 ${ISSUED_CLIENT_ID}`));
     assert.match(firstOutput.value, new RegExp(`npm run siwc -- login --plan-usage --client-id ${ISSUED_CLIENT_ID}`));
+    assert.match(firstOutput.value, /丢弃本次 authorization code，不要再次提交或复用该 code/);
     assert.doesNotMatch(firstOutput.value, /synthetic-old-authorization-code/);
     assert.equal((await readSiwcCredentialStore(storePath))?.accounts.length, 0);
 

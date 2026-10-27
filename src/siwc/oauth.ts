@@ -127,7 +127,7 @@ function tokenExchangeFailureMessage(code: string | undefined, clientId: string,
   if (code === "invalid_grant") {
     if (isSafeIssuedClientId(clientId)) {
       const planUsageOption = requestPlanUsage ? " --plan-usage" : "";
-      return `OpenAI 拒绝了本次授权码 (invalid_grant)；已丢弃该 code，不会重试或复用。请以本次授权回调签发的 client ID ${clientId} 开始全新授权：\`npm run siwc -- login${planUsageOption} --client-id ${clientId}\`。此命令会复用该 issued ID，不会再次使用 dynamic_agent_client 注册。令牌未保存。`;
+      return `OpenAI 拒绝了本次授权码 (invalid_grant)；请丢弃本次 authorization code，不要再次提交或复用该 code。该尝试关联的 issued client ID 为 ${clientId}。请用全新授权尝试：\`npm run siwc -- login${planUsageOption} --client-id ${clientId}\`。此命令会复用该 issued ID，不会再次使用 dynamic_agent_client 注册。令牌未保存。`;
     }
     return "OpenAI 拒绝了本次授权码 (invalid_grant)；已丢弃且不会重试。请从 `siwc status` 复制已保存的 issued client ID 并开始全新授权；令牌未保存。";
   }
