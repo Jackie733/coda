@@ -13,6 +13,7 @@
 - 请求体限制为 16 KB，并对消息长度、模型等待时间、工具调用总数和模型往返轮数设置上限。
 - 通过依赖注入隔离 HTTP 服务启动和 Agent 应用，方便用自动化测试验证错误路径与工具调用。
 - `npm run inspect`：本地只读代码理解原型；在发送前预览完整请求并要求明确确认。
+- `npm run siwc -- ...`：可选的本机 Sign in with ChatGPT（SIWC）身份/ChatGPT-plan provider；与 API-key 计费路径分开，不会互相兜底。
 
 ## 运行
 
@@ -75,6 +76,32 @@ CLI 先显示当前 `HEAD`、具体计划和精确文件范围；输入 `yes` �
 
 模型只返回结构化文本替换（`oldText` / `newText`），每项必须带理由和引用；CLI 会拒绝不在白名单内的路径、遍历/绝对路径、符号链接、`.git`/秘密路径、重复或不唯一的文本匹配、无效引用、控制字符和疑似凭据。为避免 Git pathspec 将批准路径展开为模式，文件名仅支持 ASCII 字母/数字及 `.`、`_`、`-`、`+`、`@` 字符。CLI 先创建不检出内容的 detached Git linked worktree，再用固定 HEAD 初始化隔离 index，并只通过 `checkout-index` 物化批准的精确文件；不启用 sparse checkout，也不改写共享 `.git/config`。源工作树中的秘密或其他文件不会复制到临时目录。创建/检出期间会禁用仓库自定义 Git hooks 与 clean/smudge/process filters。补丁只写进该隔离工作树，不运行 shell、模型建议的命令、测试或仓库脚本，也不会提交、推送、创建 PR 或合并。应用后会显示隔离工作树相对基准的完整 diff，再由用户输入 `keep` 保留该工作树供检查，或输入 `discard` 丢弃；非交互模式默认丢弃。失败或取消时 CLI 不会声称补丁成功，并报告隔离工作树是否仍然存在，但父临时目录删除失败可能没有单独报告（见 [issue #6](https://github.com/Jackie733/coda/issues/6)）。保留结果只是本地未提交的候选补丁，不代表独立 QA 已通过。
 
+## 可选 SIWC / ChatGPT plan provider（本机、明确授权）
+
+当前 Coda 的 SIWC provider 仅支持在用户控制的本机运行，不提供远端 hosted mode；这是本项目当前的产品范围，不是对所有用户控制的远端 runtime 作出的禁止判断。该 provider 不是通用代理，不用于共享、转让、轮换或代他人消耗计划额度，也没有 Coda paywall。若计划提供付费或远端托管产品，OpenAI 官方 SIWC 文档指引开发者填写 [SIWC interest form](https://openai.com/form/sign-in-with-chatgpt-interest/) 并遵循后续指引。登录只会打开 OpenAI 官方 SIWC 授权流程；不要提供 ChatGPT 密码/cookie，也不会读取浏览器会话或 Codex 私有缓存。
+
+```bash
+# 只登录身份，不请求计划推理授权
+npm run siwc -- login
+
+# 明确请求 ChatGPT plan 用量；需要在 OpenAI 官方授权页同意
+npm run siwc -- login --plan-usage
+
+# 查看脱敏状态、当前账户模型，执行只读 inspect 或退出
+npm run siwc -- status
+npm run siwc -- models
+npm run siwc -- inspect --model <从 models 返回的 slug> "请说明入口与安全边界"
+npm run siwc -- logout
+```
+
+若首次授权的 token exchange 返回 `invalid_grant`，旧 authorization code 会被丢弃。只有回调签发的 client ID 未命中终端凭据安全筛查时，错误提示才会显示该 ID 和 `npm run siwc -- login --plan-usage --client-id <issued-id>` 全新授权命令；若命中筛查，ID 与命令会被隐藏，并给出不含该值的安全说明。此筛查只控制终端回显，不改变本次 OAuth token exchange 使用 callback-issued ID 的协议行为。不要复用旧 code，也不要再次使用 `dynamic_agent_client` 注册；只有能从可信来源安全确认同一 issued ID 时才开始全新授权，否则停止并确认安全恢复方式。
+
+只有 `login --plan-usage` 才请求 `chatgpt.tokens.use.direct`（以及官方流程所需的资源/刷新 scopes）；身份登录或缺少实际授予的 plan-use scope 都不能发起计划推理。普通 `login` 默认复用活动账户的已签发 client ID；无活动账户时仅在本机只有一个已保存账户时复用它。多账户且没有活动选择时会 fail closed；可先用 `status` 查看并运行 `select <issued-client-id>`，或显式提供 `--client-id <issued-client-id>`。只有本机尚无已保存账户时才使用官方 `dynamic_agent_client` 注册首个账户；之后复用回调签发的 client ID，不会因普通登录静默新增账户。模型列表来自所选账户当前可见的官方 `/v1/models` 目录，交互终端可选择，非交互终端须显式传 `--model`。
+
+`inspect` 会先按现有只读流程收集有限的已跟踪源码，展示最终 Responses JSON 和模型，然后要求逐次确认。隐私告知：本机运行的 Coda 进程会处理这个 payload（你输入的任务/问题和所选仓库的有限已跟踪文本上下文）；批准后由本机直接发送给 OpenAI 官方 Responses API，Coda 远端服务不接收该 payload，也不代理请求。本机 Coda 进程还会接收 OpenAI OAuth 回调、用授权码换取并处理 SIWC 令牌，将凭据保存在你控制的本机配置目录；凭据不会发送到 Coda 远端服务。access token 不放进 payload，只在批准后由本机放入直连 OpenAI 的 Authorization header。请求设为 `store:false`、`stream:true`，只有收到 `response.completed` 才算成功；不使用 ChatGPT 内部 backend API。SIWC 请求从不读取 API key、不走 Hono `/agent`，失败也不会切换 API-key provider。OpenAI API key 与 ChatGPT plan/credits 是两种独立计费方式。
+
+每次请求预览都会显示“正在使用 ChatGPT 方案额度”、本次请求会消耗所选账户额度，并附 [Usage 管理入口](https://chatgpt.com/settings/usage)。用量/共享规则取决于 plan，当前 CLI 无法识别账户方案；[OpenAI 当前 Work/Codex 用量说明](https://help.openai.com/en/articles/20001516-managing-usage-with-gpt-6-astra-in-work-and-codex)指出 Plus 的五小时限额在适用应用间共享，Pro 100/200/500 当前没有这项五小时限额但仍有包含额度；还可能有 app-specific limit，其他额度规则不在此推断。首次为新账户或尚未获 plan-use scope 的账户运行 `login --plan-usage` 时显示欢迎说明；成功授权后，本机账户记录会保留该状态，注销后重登也不重复。身份-only `login` 会在打开授权页前说明 OAuth 返回的账户标识、可能的 email/name、scopes 与 token 如何由本机 Coda 进程处理；本机进程接收 OAuth 回调并将凭据保存在你控制的本机配置目录，凭据不会发送到 Coda 远端服务。身份登录本身不发送任务/仓库文本；这些上下文只在后续单独预览并批准后由本机直发 OpenAI Responses，不经 Coda 远端代理。遇到 usage-limit 时会停止 plan 请求并给出 Usage 入口；错误码不能区分 app 专属限制与共享 plan 限制，也不能推断重置时间，不会静默改用 API key。`status` 不展示 token；Unix 配置目录权限为 `0700`、凭据文件权限为 `0600`，支持 refresh-token 轮换与 logout 撤销。由于当前版本未验证 Windows owner-only ACL，SIWC 凭据读取/写入在 Windows 上会 fail closed（其他本机 CLI/TUI 功能不受影响）。CI 只使用 mock OAuth/token/model endpoints 和 synthetic repository/prompt；不会自动运行真实账户或模型 smoke。
+
 ## 调用示例
 
 ```bash
@@ -115,6 +142,7 @@ npm test
 
 - `src/app.ts`：路由、输入校验、模型交互循环和白名单工具。
 - `src/index.ts`：读取环境变量并启动 Node.js HTTP 服务。
+- `src/siwc/` 与 `src/siwc-cli.ts`：本机 SIWC OAuth、凭据存储、计划用量 Responses provider 与显式命令入口。
 - `test/app.test.ts`：接口、工具和错误路径测试。
 - `SECURITY.md`：M0/M1 安全边界、威胁模型与同 UID 范围外说明。
 - `.env.example`：环境变量模板。

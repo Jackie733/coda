@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import { inspectRepository } from "../src/repo-context.js";
 import { endpointFrom, runReadonlyCli } from "../src/readonly-cli.js";
+import { safeCliErrorText } from "../src/safe-cli-error.js";
 
 async function createSyntheticRepository(): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), "readonly-cli-fixture-"));
@@ -233,6 +234,73 @@ test("explicit consent sends exactly the complete immutable payload shown in pre
   });
 });
 
+test("readonly CLI hides token-bearing error messages without printing stack or cause", async () => {
+  await withRepository(async (root) => {
+    const secret = "synthetic-access-token-never-log";
+    const failure = new Error(`provider failed: Bearer ${secret}`);
+    Object.defineProperty(failure, "cause", { value: new Error(`nested cause ${secret}`) });
+    failure.stack = `Error: provider failed\n    at synthetic-frame (${secret})`;
+    const output = captureOutput();
+    const exitCode = await runReadonlyCli({
+      cwd: root,
+      env: { OPENAI_MODEL: "synthetic-model", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: output.writer,
+      confirmSend: async () => true,
+      provider: { send: async () => { throw failure; } },
+      fetchImpl: async () => { throw new Error("the injected provider must not use fetchImpl"); },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.match(output.text, /为保护凭据，错误详情已隐藏/);
+    assert.doesNotMatch(output.text, /synthetic-access-token-never-log|nested cause|synthetic-frame/);
+  });
+});
+
+test("safeCliErrorText strips U+200E before matching a short access_token value", () => {
+  const message = "provider failed: acce\u200Ess_token: abc12345";
+  const fallback = "为保护凭据，错误详情已隐藏。";
+  assert.ok(message.includes("\u200e"));
+
+  const result = safeCliErrorText(new Error(message), fallback);
+
+  assert.equal(result, fallback);
+  assert.doesNotMatch(result, /abc12345|\u200e/);
+});
+
+test("safeCliErrorText preserves only exact allowlisted public URL literals", () => {
+  const usageUrl = "https://chatgpt.com/settings/usage";
+  const responsesUrl = "https://api.openai.com/v1/responses";
+  const fallback = "为保护凭据，错误详情已隐藏。";
+  const safeMessage = `Review usage at ${usageUrl}; the allowed route is ${responsesUrl}.`;
+
+  assert.equal(safeCliErrorText(new Error(safeMessage), fallback, [usageUrl, responsesUrl]), safeMessage);
+  assert.equal(safeCliErrorText(new Error(`${usageUrl}?access_token=synthetic-secret`), fallback, [usageUrl]), fallback);
+});
+
+test("readonly CLI hides bidi-interleaved access_token payloads from generic error, stack, and cause", async () => {
+  await withRepository(async (root) => {
+    const secret = "synthetic-access-token-never-log";
+    const marker = String.fromCodePoint(0x202e);
+    const payload = [...`access_token=${secret}`].join(marker);
+    const failure = new Error(`provider failure: ${payload}`);
+    Object.defineProperty(failure, "cause", { value: new Error(`nested cause: ${payload}`) });
+    failure.stack = `Error: provider failure\n    at synthetic-frame (${payload})`;
+    const output = captureOutput();
+    const exitCode = await runReadonlyCli({
+      cwd: root,
+      env: { OPENAI_MODEL: "synthetic-model", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: output.writer,
+      confirmSend: async () => true,
+      provider: { send: async () => { throw failure; } },
+      fetchImpl: async () => { throw new Error("the injected provider must not use fetchImpl"); },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.match(output.text, /为保护凭据，错误详情已隐藏/);
+    assert.doesNotMatch(output.text, /synthetic-access-token-never-log|access_token|synthetic-frame|nested cause|[\u202e]/);
+  });
+});
+
 test("inspect CLI accepts a replacement provider without changing approval or payload preview policy", async () => {
   await withRepository(async (root) => {
     const output = captureOutput();
@@ -267,9 +335,12 @@ test("inspect CLI accepts a replacement provider without changing approval or pa
 
 test("unstructured model responses are marked unverified", async () => {
   await withRepository(async (root) => {
+    const bidiMarks = String.fromCodePoint(0x061c, 0x200e, 0x200f);
+    const bidiDiagnostic = `untrusted response ${bidiMarks} must stay visible`;
     for (const content of [
       "理解：代码提供问候函数。计划：检查调用者。",
       JSON.stringify({ understanding: [{ text: "缺少计划数组", citations: [] }] }),
+      bidiDiagnostic,
     ]) {
       const output = captureOutput();
       const exitCode = await runReadonlyCli({
@@ -285,6 +356,10 @@ test("unstructured model responses are marked unverified", async () => {
       assert.doesNotMatch(output.text, /引用路径和行号已核对/);
       assert.doesNotMatch(output.text, /模型理解与短计划/);
       assert.match(output.text, /未验证的模型输出/);
+      if (content === bidiDiagnostic) {
+        assert.ok(output.text.includes("untrusted response \\u061C\\u200E\\u200F must stay visible"));
+        assert.doesNotMatch(output.text, /[\u061c\u200e\u200f]/);
+      }
     }
   });
 });
@@ -332,10 +407,11 @@ test("each non-empty understanding and plan item is validated only against its o
 test("model ANSI, OSC, C0, and C1 controls are rendered as visible escapes", async () => {
   await withRepository(async (root) => {
     const output = captureOutput();
-    const text = "ANSI \u001b[31mred\u001b[0m OSC \u001b]8;;https://example.invalid\u0007link\u001b]8;;\u001b\\ C1 \u009b31m C0 \u0000";
+    const bidiMarks = String.fromCodePoint(0x061c, 0x200e, 0x200f);
+    const text = `ANSI \u001b[31mred\u001b[0m OSC \u001b]8;;https://example.invalid\u0007link\u001b]8;;\u001b\\ C1 \u009b31m C0 \u0000 BIDI ${bidiMarks}`;
     const content = JSON.stringify({
       understanding: [{ text, citations: [{ path: "src/main.ts", startLine: 1, endLine: 3 }] }],
-      plan: [{ text: "检查调用方。", citations: [{ path: "README.md", startLine: 1, endLine: 2 }] }],
+      plan: [{ text: `检查调用方 ${bidiMarks}`, citations: [{ path: "README.md", startLine: 1, endLine: 2 }] }],
     });
     const exitCode = await runReadonlyCli({
       cwd: root,
@@ -350,7 +426,31 @@ test("model ANSI, OSC, C0, and C1 controls are rendered as visible escapes", asy
     assert.match(output.text, /\\x1B\]8;;https:\/\/example\.invalid\\x07link/);
     assert.match(output.text, /\\x9B31m/);
     assert.match(output.text, /\\x00/);
-    assert.doesNotMatch(output.text, /\u001b|\u009b|\u0000|\u0007/);
+    assert.ok(output.text.includes("BIDI \\u061C\\u200E\\u200F"));
+    assert.ok(output.text.includes("检查调用方 \\u061C\\u200E\\u200F"));
+    assert.doesNotMatch(output.text, /\u001b|\u009b|\u0000|\u0007|[\u061c\u200e\u200f]/);
+  });
+});
+
+test("citation paths with bidi marks are rendered as visible text", async () => {
+  await withRepository(async (root) => {
+    const output = captureOutput();
+    const bidiMarks = String.fromCodePoint(0x061c, 0x200e, 0x200f);
+    const content = JSON.stringify({
+      understanding: [{ text: "引用路径含方向标记。", citations: [{ path: `src/main.ts${bidiMarks}`, startLine: 1, endLine: 3 }] }],
+      plan: [{ text: "核对路径。", citations: [{ path: "README.md", startLine: 1, endLine: 2 }] }],
+    });
+    const exitCode = await runReadonlyCli({
+      cwd: root,
+      env: { OPENAI_API_KEY: "mock-only-key", OPENAI_BASE_URL: "https://mock.example/v1" },
+      stdout: output.writer,
+      confirmSend: async () => true,
+      fetchImpl: async () => Response.json({ choices: [{ message: { role: "assistant", content } }] }),
+    });
+
+    assert.equal(exitCode, 1);
+    assert.ok(output.text.includes("src/main.ts\\u061C\\u200E\\u200F:1-3"));
+    assert.doesNotMatch(output.text, /[\u061c\u200e\u200f]/);
   });
 });
 

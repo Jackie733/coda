@@ -10,6 +10,8 @@ import {
 import { CONTEXT_LIMITS, isSafeRepositoryPath } from "./repo-context.js";
 import { renderDiffForTerminal } from "./patch-cli.js";
 import { visibleControls } from "./readonly-cli.js";
+import { safeCliErrorText } from "./safe-cli-error.js";
+import { readSiwcTuiStatus } from "./siwc/ui-status.js";
 
 export type FakeProviderRequest = Readonly<{
   workflow: "inspect" | "patch";
@@ -352,13 +354,15 @@ class TuiTerminal {
   }
 }
 
-function menuScreen(selection: "inspect" | "patch", notice: string): string {
+function menuScreen(selection: "inspect" | "patch", notice: string, siwcStatus: string): string {
   return [
     "Fake-provider TUI — 本地模拟，不会联网",
     "",
     notice ? `提示：${visibleControls(notice)}` : "选择演示流程：",
     `${selection === "inspect" ? ">" : " "} [I] 只读理解 (inspect)`,
     `${selection === "patch" ? ">" : " "} [P] 补丁审批与 diff (patch)`,
+    "",
+    ...siwcStatus.split("\n").map(visibleControls),
     "",
     "整个演示不会读取真实仓库文件、调用 API 或修改文件。",
   ].join("\n");
@@ -373,7 +377,7 @@ function approvalPrompt(): string {
 }
 
 function errorMessage(error: unknown): string {
-  return visibleControls(error instanceof Error ? error.message : "未知错误");
+  return visibleControls(safeCliErrorText(error, "操作失败；为保护凭据，错误详情已隐藏。"));
 }
 
 function requestPreview(request: FakeProviderRequest): string {
@@ -688,18 +692,28 @@ export async function runFakeProviderTui(options: FakeProviderTuiOptions = {}): 
   }
 
   const terminal = new TuiTerminal(input, output, env.TERM);
+  terminal.show("Fake-provider TUI — 本地模拟，不会联网\n正在读取脱敏的 SIWC 授权状态…", menuPrompt());
+  let pendingMenuAction: Promise<TuiAction | null> | null = terminal.readAction();
+  const siwcStatus = await readSiwcTuiStatus(env);
   const provider = options.provider ?? defaultFakeProvider();
   let selection: "inspect" | "patch" = "inspect";
   let notice = "";
   let exit = false;
   try {
     while (!exit) {
-      const action = await choose(
-        terminal,
-        menuScreen(selection, notice),
-        menuPrompt(),
-        ["inspect", "patch", "enter", "up", "down", "quit", "cancel"],
-      );
+      let action: TuiAction | null;
+      if (pendingMenuAction) {
+        terminal.show(menuScreen(selection, notice, siwcStatus), menuPrompt());
+        action = await pendingMenuAction;
+        pendingMenuAction = null;
+      } else {
+        action = await choose(
+          terminal,
+          menuScreen(selection, notice, siwcStatus),
+          menuPrompt(),
+          ["inspect", "patch", "enter", "up", "down", "quit", "cancel"],
+        );
+      }
       notice = "";
       if (action === null || action === "quit" || action === "cancel") break;
       if (action === "up" || action === "down") {

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
+import os from "node:os";
+import path from "node:path";
 import { existsSync } from "node:fs";
 import test from "node:test";
 import {
@@ -24,6 +26,16 @@ type TerminalFixture = Readonly<{
   getOutput: () => string;
   getRawMode: () => boolean;
 }>;
+
+let environmentFixtureNumber = 0;
+
+function testEnv(term: string): Readonly<Record<string, string>> {
+  environmentFixtureNumber += 1;
+  return {
+    TERM: term,
+    XDG_CONFIG_HOME: path.join(os.tmpdir(), `coda-fake-provider-tui-${process.pid}-${environmentFixtureNumber}`),
+  };
+}
 
 function terminalFixture(columns = 80): TerminalFixture {
   const stdin = new PassThrough() as FakeInput;
@@ -60,7 +72,7 @@ test("inspect accepts a non-demo task, supports backspace editing, and requires 
   const run = runFakeProviderTui({
     stdin: fixture.stdin,
     stdout: fixture.stdout,
-    env: { TERM: "xterm" },
+    env: testEnv("xterm"),
     provider: responseProvider(async (request) => {
       providerCalls += 1;
       received = request;
@@ -83,7 +95,7 @@ test("patch collects and edits task, plan, and exact files before scope confirma
   const run = runFakeProviderTui({
     stdin: fixture.stdin,
     stdout: fixture.stdout,
-    env: { TERM: "xterm" },
+    env: testEnv("xterm"),
     provider: responseProvider(async (request) => {
       providerCalls += 1;
       received = request;
@@ -114,7 +126,7 @@ test("cancel and back during request preview return without a provider request",
       const run = runFakeProviderTui({
         stdin: fixture.stdin,
         stdout: fixture.stdout,
-        env: { TERM: "xterm" },
+        env: testEnv("xterm"),
         provider: responseProvider(async () => {
           providerCalls += 1;
           return { workflow: "inspect", summary: "should not be reached" };
@@ -135,7 +147,7 @@ test("empty task, plan, and file inputs are rejected before the explicit gates",
   const run = runFakeProviderTui({
     stdin: fixture.stdin,
     stdout: fixture.stdout,
-    env: { TERM: "xterm" },
+    env: testEnv("xterm"),
     provider: responseProvider(async (request) => {
       providerCalls += 1;
       received = request;
@@ -162,7 +174,7 @@ test("canceling task entry or refusing patch scope makes zero provider calls", a
     const run = runFakeProviderTui({
       stdin: fixture.stdin,
       stdout: fixture.stdout,
-      env: { TERM: "xterm" },
+      env: testEnv("xterm"),
       provider: responseProvider(async () => {
         providerCalls += 1;
         return { workflow: "inspect", summary: "unexpected" };
@@ -179,7 +191,7 @@ test("canceling task entry or refusing patch scope makes zero provider calls", a
     const run = runFakeProviderTui({
       stdin: fixture.stdin,
       stdout: fixture.stdout,
-      env: { TERM: "xterm" },
+      env: testEnv("xterm"),
       provider: responseProvider(async () => {
         providerCalls += 1;
         return { workflow: "patch", diff: "unexpected" };
@@ -204,7 +216,7 @@ test("provider failure is visible and recovery requires a fresh explicit approva
   const run = runFakeProviderTui({
     stdin: fixture.stdin,
     stdout: fixture.stdout,
-    env: { TERM: "xterm" },
+    env: testEnv("xterm"),
     provider,
   });
   sendKeys(fixture, "iTask one\nyriTask two\nybq");
@@ -221,7 +233,7 @@ test("diff control characters are rendered as visible text", async () => {
   const run = runFakeProviderTui({
     stdin: fixture.stdin,
     stdout: fixture.stdout,
-    env: { TERM: "xterm" },
+    env: testEnv("xterm"),
     provider: responseProvider(async () => ({ workflow: "patch", diff: hostileDiff })),
   });
   sendKeys(fixture, "pTask for escaping\nSafe synthetic plan\nsrc/demo.ts\n\nyykq");
@@ -240,7 +252,7 @@ test("narrow screens wrap content and resize redraws without losing the active m
   const run = runFakeProviderTui({
     stdin: fixture.stdin,
     stdout: fixture.stdout,
-    env: { TERM: "xterm" },
+    env: testEnv("xterm"),
   });
   fixture.stdout.columns = 14;
   fixture.stdout.emit("resize");
@@ -255,7 +267,7 @@ test("TERM=dumb uses plain line input and non-TTY exits without waiting", async 
   const dumbRun = runFakeProviderTui({
     stdin: dumb.stdin,
     stdout: dumb.stdout,
-    env: { TERM: "dumb" },
+    env: testEnv("dumb"),
   });
   sendKeys(dumb, "q\n");
   assert.equal(await Promise.race([dumbRun, delay(1000).then(() => "timeout")]), 0);
@@ -285,7 +297,7 @@ test("TERM=dumb uses plain line input and non-TTY exits without waiting", async 
 test("CLI completes a keyboard approval flow under a real PTY", { skip: process.platform !== "linux" || !existsSync("/usr/bin/script") }, async () => {
   const child = spawn("/usr/bin/script", ["-qec", "stty cols 100 rows 30; node --import tsx src/tui.ts", "/dev/null"], {
     cwd: process.cwd(),
-    env: { ...process.env, TERM: "xterm-256color" },
+    env: { ...process.env, ...testEnv("xterm-256color") },
     stdio: ["pipe", "pipe", "pipe"],
   }) as ChildProcessWithoutNullStreams;
   let output = "";
